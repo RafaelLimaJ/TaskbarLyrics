@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "TaskbarLyrics Sync Hook",
+  "version": "2.0.0",
+  "description": "Envia o tempo e o nome da música do YouTube Music para o app de letras na barra de tarefas.",
+  "permissions": ["storage"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://music.youtube.com/*"
+      ],
+      "js": ["content.js"],
+      "world": "MAIN",
+      "run_at": "document_start"
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+﻿# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs e arquivos dinamicos locais
+*.log
+TaskbarLyrics.log
+crash.log
+
+# Configuracoes locais de execucao
+position.json
+
+# Node
+node_modules/
+
+# Ambientes virtuais
+venv/
+.venv/
+env/
