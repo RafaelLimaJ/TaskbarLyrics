@@ -1,5 +1,11 @@
 @echo off
 cd /d "%~dp0"
 taskkill /f /im pythonw.exe >nul 2>&1
-start "" "C:\Users\rafae\AppData\Local\Programs\Python\Python312\pythonw.exe" "app.py"
+
+where pythonw >nul 2>&1
+if %errorlevel% equ 0 (
+    start "" pythonw app.py
+) else (
+    start "" python app.py
+)
 exit

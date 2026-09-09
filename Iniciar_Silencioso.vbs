@@ -1,7 +1,6 @@
-' TaskbarLyrics - Startup Autom?tico
 Set WshShell = CreateObject("WScript.Shell")
-scriptDir = "c:\Users\rafae\Desktop\PASTA DAS PASTAS\TaskbarLyrics"
-pythonw = "C:\Users\rafae\AppData\Local\Programs\Python\Python312\pythonw.exe"
+Set fso = CreateObject("Scripting.FileSystemObject")
+scriptDir = fso.GetParentFolderName(WScript.ScriptFullName)
 
 WshShell.CurrentDirectory = scriptDir
-WshShell.Run """" & pythonw & """ app.py", 0, False
+WshShell.Run "cmd /c Iniciar_Letras.bat", 0, False
