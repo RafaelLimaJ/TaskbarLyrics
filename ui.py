@@ -150,7 +150,7 @@ class KaraokeLineWidget(QWidget):
                         painter.restore()
 
 
-            # 3. Próximo verso entra embaixo
+            # 3. Próximo verso entra embaixo (ou tradução com karaokê)
             if self.next_text:
                 is_note_trans_next = (self.next_text.strip() == "♪")
                 font_trans_next = self.font_symbol if is_note_trans_next else self.font_next
@@ -158,6 +158,29 @@ class KaraokeLineWidget(QWidget):
                 next_alpha = int(175 * ease)
                 s_alpha = int(140 * ease)
                 self._draw_text_with_shadow(painter, 0, next_y, self.next_text, font_trans_next, QColor(255, 255, 255, next_alpha), s_alpha)
+
+                if self.progress > 0.0:
+                    fm_n = QFontMetrics(font_trans_next)
+                    tw_n = fm_n.horizontalAdvance(self.next_text)
+                    if tw_n > 0:
+                        if is_note_trans_next:
+                            note_h_n = 20
+                            fill_h_n = int(note_h_n * self.progress)
+                            clip_y_n = next_y - fill_h_n + 3
+                            painter.save()
+                            painter.setClipRect(-2, clip_y_n, tw_n + 8, fill_h_n + 4)
+                            painter.setFont(font_trans_next)
+                            painter.setPen(QColor(255, 255, 255, 255))
+                            painter.drawText(0, next_y, self.next_text)
+                            painter.restore()
+                        else:
+                            act_w_n = int(tw_n * self.progress)
+                            painter.save()
+                            painter.setClipRect(0, next_y - 12, act_w_n, 20)
+                            painter.setFont(font_trans_next)
+                            painter.setPen(QColor(255, 255, 255, 255))
+                            painter.drawText(0, next_y, self.next_text)
+                            painter.restore()
 
             painter.end()
             return
@@ -199,7 +222,7 @@ class KaraokeLineWidget(QWidget):
                 painter.drawText(0, line_y, self.current_text)
         painter.restore()
 
-        # 2. SEGUNDA LINHA (Tradução com karaokê sutil OU Próximo Verso)
+        # 2. SEGUNDA LINHA (Tradução com karaokê em branco puro OU Próximo Verso)
         if self.next_text:
             is_note_next = (self.next_text.strip() == "♪")
             font_line2 = self.font_symbol if is_note_next else self.font_next
@@ -218,7 +241,7 @@ class KaraokeLineWidget(QWidget):
             # Linha de fundo secundária (translúcida suave)
             self._draw_text_with_shadow(painter, 0, line2_y, self.next_text, font_line2, QColor(255, 255, 255, 140), 120)
 
-            # Efeito Karaokê na tradução / linha secundária
+            # Efeito Karaokê na tradução / linha secundária (Branco Puro 255)
             if self.progress > 0.0 and tw2 > 0:
                 if is_note_next:
                     # Efeito copo na nota musical secundária
@@ -227,14 +250,14 @@ class KaraokeLineWidget(QWidget):
                     clip_y2 = line2_y - fill_h2 + 3
                     painter.setClipRect(-2, clip_y2, tw2 + 8, fill_h2 + 4)
                     painter.setFont(font_line2)
-                    painter.setPen(QColor(255, 255, 255, 240))
+                    painter.setPen(QColor(255, 255, 255, 255))
                     painter.drawText(0, line2_y, self.next_text)
                 else:
-                    # Preenchimento branco suave destacando o avanço na tradução
+                    # Preenchimento branco puro destacando simultaneamente a tradução
                     act_w2 = int(tw2 * self.progress)
-                    painter.setClipRect(0, 0, act_w2, 38)
+                    painter.setClipRect(0, line2_y - 14, act_w2, 22)
                     painter.setFont(font_line2)
-                    painter.setPen(QColor(255, 255, 255, 240))
+                    painter.setPen(QColor(255, 255, 255, 255))
                     painter.drawText(0, line2_y, self.next_text)
             painter.restore()
 
