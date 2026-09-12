@@ -44,6 +44,7 @@ class KaraokeLineWidget(QWidget):
         self.next_text = ""
         self.progress = 0.0
         self.is_card_mode = False
+        self.is_translate_mode = False
 
         self.transition_start_time = 0.0
         self.transition_duration = 0.24  # 240ms cubic ease
@@ -55,7 +56,7 @@ class KaraokeLineWidget(QWidget):
         self.font_next = QFont("SF Pro Display", 9, QFont.Weight.DemiBold)
         self.font_next.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
 
-    def set_state(self, current_text, next_text, progress, is_card_mode):
+    def set_state(self, current_text, next_text, progress, is_card_mode, is_translate_mode=False):
         text_changed = (self.current_text != current_text)
 
         if text_changed and not is_card_mode and not self.is_card_mode and self.current_text:
@@ -65,11 +66,13 @@ class KaraokeLineWidget(QWidget):
         if (text_changed or
             self.next_text != next_text or
             self.is_card_mode != is_card_mode or
+            self.is_translate_mode != is_translate_mode or
             abs(self.progress - progress) > 0.002):
             self.current_text = current_text
             self.next_text = next_text
             self.progress = max(0.0, min(1.0, progress))
             self.is_card_mode = is_card_mode
+            self.is_translate_mode = is_translate_mode
             self.update()
 
     def _draw_text_with_shadow(self, painter, x, y, text, font, text_color, shadow_alpha=160):
@@ -159,7 +162,8 @@ class KaraokeLineWidget(QWidget):
                 s_alpha = int(140 * ease)
                 self._draw_text_with_shadow(painter, 0, next_y, self.next_text, font_trans_next, QColor(255, 255, 255, next_alpha), s_alpha)
 
-                if self.progress > 0.0:
+                # Karaokê na segunda linha APENAS se o modo de tradução estiver ativado
+                if self.is_translate_mode and self.progress > 0.0:
                     fm_n = QFontMetrics(font_trans_next)
                     tw_n = fm_n.horizontalAdvance(self.next_text)
                     if tw_n > 0:
@@ -222,7 +226,7 @@ class KaraokeLineWidget(QWidget):
                 painter.drawText(0, line_y, self.current_text)
         painter.restore()
 
-        # 2. SEGUNDA LINHA (Tradução com karaokê em branco puro OU Próximo Verso)
+        # 2. SEGUNDA LINHA (Tradução com karaokê em branco puro OU Próximo Verso estático)
         if self.next_text:
             is_note_next = (self.next_text.strip() == "♪")
             font_line2 = self.font_symbol if is_note_next else self.font_next
@@ -241,8 +245,8 @@ class KaraokeLineWidget(QWidget):
             # Linha de fundo secundária (translúcida suave)
             self._draw_text_with_shadow(painter, 0, line2_y, self.next_text, font_line2, QColor(255, 255, 255, 140), 120)
 
-            # Efeito Karaokê na tradução / linha secundária (Branco Puro 255)
-            if self.progress > 0.0 and tw2 > 0:
+            # Efeito Karaokê na segunda linha APENAS se estiver com o modo de tradução ativado
+            if self.is_translate_mode and self.progress > 0.0 and tw2 > 0:
                 if is_note_next:
                     # Efeito copo na nota musical secundária
                     note_h2 = 20
@@ -678,4 +682,5 @@ class TaskbarLyricsWidget(QWidget):
             return
 
         l1, l2, prog, is_card = self.state.get_display_state()
-        self.karaoke_widget.set_state(l1, l2, prog, is_card)
+        is_trans = getattr(self.state, "translate_enabled", False)
+        self.karaoke_widget.set_state(l1, l2, prog, is_card, is_trans)
