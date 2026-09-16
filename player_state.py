@@ -279,12 +279,24 @@ class PlayerStateManager:
                     rhythm_prog = calculate_rhythm_progress(current_text, linear_prog)
                     return (current_text, next_sung, rhythm_prog, False)
             else:
-                # Verso normal: a voz preenche todo o intervalo da estrofe
-                # Deixa apenas uma fração de 0.15s no final para transição fluida para o próximo verso
-                singing_time = max(0.4, gap - 0.15)
+                # Verso normal: estima a duração natural do canto a partir do texto
+                # (palavras/caracteres) e do ritmo típico da música. Se sobrar uma pausa
+                # real depois disso (ex: um trecho de instrumental antes do próximo verso),
+                # essa sobra NÃO é tratada como parte do canto — a linha fica totalmente
+                # preenchida e aguarda o próximo verso, em vez de "arrastar" o preenchimento
+                # até o fim do intervalo (o que fazia o karaokê parecer atrasado).
+                text_ratio = max(0.8, min(1.6, (word_count * 0.35 + char_count * 0.04) / 3.0))
+                natural_singing = max(0.6, min(gap - 0.15, base_tempo * text_ratio))
+                pause_after = gap - natural_singing
+
+                singing_time = natural_singing if pause_after >= 1.0 else max(0.4, gap - 0.15)
+
                 time_in_verse = current_time - start_time
-                linear_prog = max(0.0, min(1.0, time_in_verse / max(0.2, singing_time)))
-                rhythm_prog = calculate_rhythm_progress(current_text, linear_prog)
+                if time_in_verse >= singing_time:
+                    rhythm_prog = 1.0
+                else:
+                    linear_prog = max(0.0, min(1.0, time_in_verse / max(0.2, singing_time)))
+                    rhythm_prog = calculate_rhythm_progress(current_text, linear_prog)
                 return (current_text, next_sung, rhythm_prog, False)
 
 
