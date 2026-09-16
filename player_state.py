@@ -176,6 +176,23 @@ class PlayerStateManager:
     def is_timed_out(self):
         return (time.perf_counter() - self.last_heartbeat_time) > 10.0
 
+    @staticmethod
+    def _progress_from_breakpoints(breakpoints, current_time, text_len):
+        """Progresso exato (0..1) a partir de timestamps reais por palavra (richsync).
+        Interpola entre os pontos (tempo, posição do caractere) obtidos da API."""
+        if not breakpoints or text_len <= 0:
+            return 0.0
+        if current_time <= breakpoints[0][0]:
+            return 0.0
+        for k in range(len(breakpoints) - 1):
+            t0, c0 = breakpoints[k]
+            t1, c1 = breakpoints[k + 1]
+            if current_time <= t1:
+                frac = 1.0 if t1 <= t0 else (current_time - t0) / (t1 - t0)
+                char_pos = c0 + frac * (c1 - c0)
+                return max(0.0, min(1.0, char_pos / text_len))
+        return 1.0
+
     def _get_next_sung_text(self, start_idx):
         for j in range(start_idx, len(self.lyrics)):
             t = self.lyrics[j]["text"].strip()
@@ -254,6 +271,10 @@ class PlayerStateManager:
             word_count = max(1, len(words))
             char_count = len(current_text)
 
+            # Timing real por palavra (richsync do Musixmatch), quando disponível para este verso.
+            # Substitui a estimativa heurística por timestamps reais de início/fim de cada palavra.
+            bp = self.lyrics[active_idx].get("words")
+
             # Ritmo base da música específica:
             base_tempo = max(1.5, getattr(self, "median_verse_gap", 3.5))
 
@@ -262,9 +283,13 @@ class PlayerStateManager:
             is_huge_solo_break = (gap >= max(8.0, base_tempo * 2.5))
 
             if is_huge_solo_break:
-                # Canto com tempo natural e depois transita para solo de verdade
-                text_ratio = max(0.8, min(1.6, (word_count * 0.35 + char_count * 0.04) / 3.0))
-                singing_time = max(2.0, min(base_tempo * text_ratio, gap - 4.0))
+                if bp:
+                    # Fim real do canto reportado pela API: usa diretamente, sem estimar.
+                    singing_time = max(0.3, bp[-1][0] - start_time)
+                else:
+                    # Canto com tempo natural e depois transita para solo de verdade
+                    text_ratio = max(0.8, min(1.6, (word_count * 0.35 + char_count * 0.04) / 3.0))
+                    singing_time = max(2.0, min(base_tempo * text_ratio, gap - 4.0))
                 hold_time = 0.8
                 instrumental_start = start_time + singing_time + hold_time
                 instrumental_duration = end_time - instrumental_start
@@ -275,9 +300,18 @@ class PlayerStateManager:
                     return ("♪", line2_display, solo_prog, False)
                 else:
                     time_in_verse = current_time - start_time
-                    linear_prog = max(0.0, min(1.0, time_in_verse / max(0.2, singing_time)))
-                    rhythm_prog = calculate_rhythm_progress(current_text, linear_prog)
+                    if bp:
+                        rhythm_prog = self._progress_from_breakpoints(bp, current_time, len(current_text))
+                    else:
+                        linear_prog = max(0.0, min(1.0, time_in_verse / max(0.2, singing_time)))
+                        rhythm_prog = calculate_rhythm_progress(current_text, linear_prog)
                     return (current_text, next_sung, rhythm_prog, False)
+            elif bp:
+                # Timing real por palavra: a API já informa quando o verso termina de verdade,
+                # então qualquer sobra até o próximo verso é silêncio/instrumental de fato e a
+                # linha simplesmente fica totalmente preenchida enquanto espera.
+                rhythm_prog = self._progress_from_breakpoints(bp, current_time, len(current_text))
+                return (current_text, next_sung, rhythm_prog, False)
             else:
                 # Verso normal: estima a duração natural do canto a partir do texto
                 # (palavras/caracteres) e do ritmo típico da música. Se sobrar uma pausa
@@ -313,13 +347,20 @@ class PlayerStateManager:
             words = current_text.split()
             word_count = max(1, len(words))
             char_count = len(current_text)
-            singing_time = max(1.5, word_count * 0.35 + char_count * 0.040)
+            bp = self.lyrics[active_idx].get("words")
+            if bp:
+                singing_time = max(0.3, bp[-1][0] - start_time)
+            else:
+                singing_time = max(1.5, word_count * 0.35 + char_count * 0.040)
 
             time_in_verse = current_time - start_time
             last_line2 = secondary_text if (getattr(self, "translate_enabled", False) and secondary_text) else (self.artist or self.title)
             if time_in_verse < (singing_time + 8.0):
-                linear_prog = max(0.0, min(1.0, time_in_verse / max(0.2, singing_time)))
-                rhythm_prog = calculate_rhythm_progress(current_text, linear_prog)
+                if bp:
+                    rhythm_prog = self._progress_from_breakpoints(bp, current_time, len(current_text))
+                else:
+                    linear_prog = max(0.0, min(1.0, time_in_verse / max(0.2, singing_time)))
+                    rhythm_prog = calculate_rhythm_progress(current_text, linear_prog)
                 return (current_text, last_line2, rhythm_prog, False)
             else:
                 return (self.title, self.artist, 1.0, True)
