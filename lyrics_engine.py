@@ -200,119 +200,6 @@ def fetch_from_musixmatch(track_name, artist_name):
     return None
 
 # ---------------------------------------------------------
-# RICHSYNC (TIMING REAL POR PALAVRA) - MUSIXMATCH
-# API não-oficial e instável: qualquer falha aqui simplesmente retorna None
-# e o motor de busca cai de volta para as fontes de letra sincronizada por
-# linha (LRCLIB/Musixmatch subtitle), que continuam funcionando normalmente.
-# ---------------------------------------------------------
-def parse_richsync_segments(segments):
-    lines = []
-    for seg in segments:
-        try:
-            ts = float(seg.get("ts", 0.0))
-            te = float(seg.get("te", ts))
-        except (TypeError, ValueError):
-            continue
-        raw_text = (seg.get("x") or "").strip()
-
-        if not raw_text:
-            lines.append({"time": ts, "text": "♪"})
-            continue
-
-        tokens = seg.get("l") or []
-        breakpoints = []
-        search_from = 0
-        for tok in tokens:
-            chunk = tok.get("c", "")
-            if not chunk or not chunk.strip():
-                continue
-            idx = raw_text.find(chunk, search_from)
-            if idx == -1:
-                idx = search_from
-            try:
-                offset = float(tok.get("o", 0.0))
-            except (TypeError, ValueError):
-                offset = 0.0
-            breakpoints.append((round(ts + offset, 3), idx))
-            search_from = idx + len(chunk)
-
-        if not breakpoints or breakpoints[0] != (ts, 0):
-            breakpoints.insert(0, (ts, 0))
-        breakpoints.append((te, len(raw_text)))
-
-        lines.append({"time": ts, "text": raw_text, "words": breakpoints})
-
-    lines.sort(key=lambda x: x["time"])
-    return lines
-
-def fetch_richsync_from_musixmatch(track_name, artist_name):
-    global _mxm_idx
-    if not artist_name:
-        return None
-
-    with _mxm_lock:
-        start_idx = _mxm_idx
-
-    for i in range(len(_mxm_tokens)):
-        token = _mxm_tokens[(start_idx + i) % len(_mxm_tokens)]
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        try:
-            match_q = urllib.parse.urlencode({
-                "q_track": track_name,
-                "q_artist": artist_name,
-                "usertoken": token,
-                "app_id": "web-desktop-app-v1.0"
-            })
-            match_url = "https://apic-desktop.musixmatch.com/ws/1.1/matcher.track.get?" + match_q
-            match_req = urllib.request.Request(match_url, headers=headers)
-            with urllib.request.urlopen(match_req, timeout=2.5) as resp:
-                match_data = json.loads(resp.read().decode())
-
-            header = match_data.get("message", {}).get("header", {})
-            if header.get("status_code") != 200:
-                continue
-
-            track = match_data.get("message", {}).get("body", {}).get("track", {})
-            if not track.get("has_richsync"):
-                return None
-
-            track_id = track.get("track_id")
-            commontrack_id = track.get("commontrack_id")
-            if not track_id and not commontrack_id:
-                return None
-
-            rich_params = {"usertoken": token, "app_id": "web-desktop-app-v1.0"}
-            if track_id:
-                rich_params["track_id"] = track_id
-            else:
-                rich_params["commontrack_id"] = commontrack_id
-
-            rich_url = "https://apic-desktop.musixmatch.com/ws/1.1/track.richsync.get?" + urllib.parse.urlencode(rich_params)
-            rich_req = urllib.request.Request(rich_url, headers=headers)
-            with urllib.request.urlopen(rich_req, timeout=2.5) as rresp:
-                rich_data = json.loads(rresp.read().decode())
-
-            rich_header = rich_data.get("message", {}).get("header", {})
-            if rich_header.get("status_code") != 200:
-                continue
-
-            richsync_body = rich_data.get("message", {}).get("body", {}).get("richsync", {}).get("richsync_body")
-            if not richsync_body:
-                return None
-
-            segments = json.loads(richsync_body)
-            parsed = parse_richsync_segments(segments)
-            if parsed and not is_fake_synced_lyrics(parsed):
-                log_debug(f"[MXM Richsync] {len(parsed)} versos com timing real por palavra encontrados.")
-                return parsed
-            return None
-        except Exception as e:
-            log_debug(f"[MXM Richsync] Indisponível, usando fallback por linha: {e}")
-            with _mxm_lock:
-                _mxm_idx = (_mxm_idx + 1) % len(_mxm_tokens)
-    return None
-
-# ---------------------------------------------------------
 # ---------------------------------------------------------
 # AJUSTE INTELIGENTE DE TEMPO (SPED UP / SLOWED / NIGHTCORE)
 # ---------------------------------------------------------
@@ -332,13 +219,10 @@ def check_and_rescale_lyrics(parsed_lines, user_duration, item_duration, cand_ti
         log_debug(f"[LyricsEngine] Versão com tempo modificado detectada ('{cand_title}'). Auto-escalando timestamps por {ratio:.4f}x ({item_duration:.1f}s -> {user_duration:.1f}s).")
         scaled = []
         for line in parsed_lines:
-            new_line = {
+            scaled.append({
                 "time": round(line["time"] * ratio, 2),
                 "text": line["text"]
-            }
-            if "words" in line:
-                new_line["words"] = [(round(t * ratio, 3), c) for (t, c) in line["words"]]
-            scaled.append(new_line)
+            })
         return scaled
     return parsed_lines
 
@@ -489,35 +373,15 @@ def fetch_synced_lyrics_sync(track_name, artist_name="", duration=0):
                 pass
         return None
 
-    def worker_musixmatch_richsync():
-        if clean_artist:
-            try:
-                return fetch_richsync_from_musixmatch(query, clean_artist)
-            except Exception:
-                pass
-        return None
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
         futures = {
             executor.submit(worker_lrclib_get): "GET",
             executor.submit(worker_lrclib_search): "SEARCH",
-            executor.submit(worker_musixmatch): "MXM",
-            executor.submit(worker_musixmatch_richsync): "RICHSYNC"
+            executor.submit(worker_musixmatch): "MXM"
         }
-        results = {}
         for future in concurrent.futures.as_completed(futures):
-            try:
-                results[futures[future]] = future.result()
-            except Exception:
-                results[futures[future]] = None
-
-        # RICHSYNC (timing real por palavra) tem prioridade quando disponível.
-        # Se falhar/indisponível para a música, cai automaticamente para as
-        # fontes de letra sincronizada por linha de sempre (comportamento antigo).
-        for source in ("RICHSYNC", "GET", "SEARCH", "MXM"):
-            res = results.get(source)
+            res = future.result()
             if res and len(res) >= 3:
-                log_debug(f"[LyricsEngine] Fonte escolhida: {source} ({len(res)} versos)")
                 _lyrics_cache[cache_key] = res
                 return res
 
