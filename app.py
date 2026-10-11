@@ -7,6 +7,7 @@ from player_state import PlayerStateManager
 from ui import TaskbarLyricsWidget, GLOBAL_SIGNALS
 from win32_utils import setup_topmost_event_hook
 from server import start_server_thread
+from voice_detector import VoiceDetector
 
 def load_fonts():
     if os.path.exists(FONTS_DIR):
@@ -26,6 +27,8 @@ def main():
     load_fonts()
 
     state = PlayerStateManager()
+    state.voice_detector = VoiceDetector()
+    state.voice_detector.start()
     widget = TaskbarLyricsWidget(state)
 
     setup_topmost_event_hook(lambda: GLOBAL_SIGNALS.force_topmost.emit())

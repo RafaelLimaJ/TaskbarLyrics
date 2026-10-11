@@ -1,4 +1,4 @@
-﻿# TaskbarLyrics
+# TaskbarLyrics
 
 A sleek, lightweight, and hardware-accelerated synced lyrics and karaoke overlay embedded directly into the Windows taskbar, built with Python (PyQt6 + Win32 API) and integrated in real-time with YouTube Music via a local WebSocket bridge.
 
@@ -42,7 +42,7 @@ cd TaskbarLyrics
 
 ### 3. Install Python Dependencies
 ```bash
-pip install PyQt6 pywin32 websockets requests
+pip install PyQt6 pywin32 websockets requests numpy soundcard
 ```
 
 ### 4. Install Browser Extension

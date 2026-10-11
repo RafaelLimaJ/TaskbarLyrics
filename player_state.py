@@ -101,6 +101,12 @@ class PlayerStateManager:
         self.translate_enabled = False
         self.line2_is_translation = False
         self.median_verse_gap = 3.5
+        self.voice_detector = None
+        self._voice_idx = -1
+        self._voice_end = None
+        self._voice_solo = False
+        self._voice_p0 = 0.0
+        self._voice_det_t = 0.0
 
         self.last_sync_audio_time = 0.0
         self.last_sync_local_time = time.perf_counter()
@@ -136,6 +142,7 @@ class PlayerStateManager:
             self.lyrics = []
             self.translations = {}
             self.median_verse_gap = 3.5
+            self._voice_idx = -1
             self.last_sync_audio_time = 0.0
             self.last_sync_local_time = time.perf_counter()
             self.is_playing = True
@@ -200,6 +207,37 @@ class PlayerStateManager:
                 char_pos = c0 + frac * (c1 - c0)
                 return max(0.0, min(1.0, char_pos / text_len))
         return 1.0
+
+    def _song_time_at(self, perf_t):
+        elapsed = (perf_t - self.last_sync_local_time) if self.is_playing else 0.0
+        return self.last_sync_audio_time + elapsed
+
+    def _apply_voice_detection(self, idx, start_time, current_time, prog):
+        """Refina o preenchimento estimado usando a voz detectada no áudio (só em versos sem tempo real da API).
+        - Silêncio vocal sustentado perto do fim do verso => fecha o verso (instrumental não conta como canto).
+        - Voz ainda ativa com o verso quase completo => segura a última palavra até a voz parar."""
+        det = self.voice_detector
+        if det is None or not det.is_ready():
+            return prog
+        if self._voice_idx != idx:
+            self._voice_idx = idx
+            self._voice_end = None
+            self._voice_solo = False
+        if self._voice_end is None:
+            qs = det.quiet_since()
+            if qs is not None and (time.perf_counter() - qs) >= 0.8 and prog >= 0.4:
+                qs_song = self._song_time_at(qs)
+                if qs_song >= start_time + 1.2:
+                    self._voice_end = qs_song
+                    self._voice_p0 = prog
+                    self._voice_det_t = current_time
+                    log_debug(f"[Voz] Canto parou no verso {idx} em {qs_song:.1f}s (preenchimento estava em {prog:.0%}).")
+        if self._voice_end is not None:
+            k = min(1.0, max(0.0, (current_time - self._voice_det_t) / 0.25))
+            return max(prog, self._voice_p0 + (1.0 - self._voice_p0) * k)
+        if det.voiced() and prog > 0.93:
+            return 0.93
+        return prog
 
     def _get_next_sung_text(self, start_idx):
         for j in range(start_idx, len(self.lyrics)):
@@ -346,6 +384,18 @@ class PlayerStateManager:
                 else:
                     linear_prog = max(0.0, min(1.0, time_in_verse / max(0.2, singing_time)))
                     rhythm_prog = calculate_rhythm_progress(current_text, linear_prog)
+                rhythm_prog = self._apply_voice_detection(active_idx, start_time, current_time, rhythm_prog)
+
+                # Voz parou de vez e ainda falta bastante até o próximo verso: instrumental (♪)
+                if self._voice_end is not None and self._voice_idx == active_idx:
+                    solo_start = self._voice_end + 1.6
+                    if not self._voice_solo and current_time >= solo_start and (end_time - current_time) >= 2.5:
+                        self._voice_solo = True
+                    if self._voice_solo:
+                        solo_prog = max(0.0, min(1.0, (current_time - solo_start) / max(0.2, end_time - solo_start)))
+                        line2_display = "♪" if getattr(self, "translate_enabled", False) else self._get_next_sung_text(active_idx + 1)
+                        self.line2_is_translation = bool(getattr(self, "translate_enabled", False))
+                        return ("♪", line2_display, solo_prog, False)
                 return (current_text, next_sung, rhythm_prog, False)
 
 
