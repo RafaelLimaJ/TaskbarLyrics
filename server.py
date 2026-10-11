@@ -4,7 +4,7 @@ import asyncio
 import threading
 import websockets
 from config import WS_HOST, WS_PORT, log_debug
-from lyrics_engine import fetch_synced_lyrics_sync, translate_lyrics_to_pt
+from lyrics_engine import fetch_synced_lyrics_sync, fetch_wordsync_lyrics_sync, translate_lyrics_to_pt
 from ui import GLOBAL_SIGNALS
 
 class WebSocketServerController:
@@ -14,19 +14,73 @@ class WebSocketServerController:
         self.state = state_manager
         self.ui_widget = ui_widget
         self.current_fetch_task = None
+        self.current_wordsync_task = None
         self.current_translate_task = None
+        self.translate_requested_for = None
         self.last_track_change_time = 0.0
         self.last_audio_time = 0.0
         self.last_audio_advance_time = 0.0
         self.consecutive_zero_drops = 0
 
-    async def translate_worker(self, target_title, lyrics_copy):
+    def maybe_start_translation(self):
+        """Traduz apenas com a opção ligada e uma vez por letra (evita 429 do Google)."""
+        st = self.state
+        if not st.translate_enabled or not st.lyrics or st.translations:
+            return
+        if self.translate_requested_for is st.lyrics:
+            return
+        self.translate_requested_for = st.lyrics
+        if self.current_translate_task and not self.current_translate_task.done():
+            self.current_translate_task.cancel()
+        self.current_translate_task = asyncio.create_task(self.translate_worker(st.title, list(st.lyrics)))
+
+    async def translate_worker(self, target_title, lyrics_copy, attempt=0):
         try:
             trans_map = await asyncio.to_thread(translate_lyrics_to_pt, lyrics_copy)
-            if self.state.title == target_title and trans_map:
+            # Só aplica se a faixa e a letra ainda são as mesmas (índices da tradução dependem da letra)
+            if self.state.title != target_title or self.state.lyrics != lyrics_copy:
+                return
+            if trans_map:
                 self.state.set_translations(trans_map)
+
+            sung = [i for i, l in enumerate(lyrics_copy) if l["text"].strip() and l["text"] != "♪"]
+            missing = [i for i in sung if not trans_map.get(i)]
+            if missing and attempt < 3:
+                await asyncio.sleep(60 if attempt == 0 else 150)
+                await self.translate_worker(target_title, lyrics_copy, attempt + 1)
+        except asyncio.CancelledError:
+            pass
         except Exception as e:
             log_debug(f"[Server] Erro ao traduzir letras: {e}")
+
+    async def wordsync_worker(self, target_title):
+        try:
+            # Aguarda um pouco: o LRCLIB (rápido) costuma entregar antes e serve de referência de versão
+            await asyncio.sleep(1.5)
+            if self.state.title != target_title:
+                return
+            cur_artist = self.state.artist
+            cur_dur = self.state.duration
+            reference = list(self.state.lyrics)
+            wordsync = await asyncio.to_thread(fetch_wordsync_lyrics_sync, target_title, cur_artist, cur_dur, reference)
+
+            if not wordsync or self.state.title != target_title:
+                return
+            # Se o LRCLIB chegou depois da referência vazia, revalida contra ele
+            if self.state.lyrics and not reference:
+                first_old = next((l["time"] for l in self.state.lyrics if l["text"] != "♪"), None)
+                first_new = next((l["time"] for l in wordsync if l["text"] != "♪"), None)
+                if first_old is not None and first_new is not None and abs(first_old - first_new) > 4.0:
+                    return
+
+            self.state.set_lyrics(wordsync)
+            self.state.set_translations({})
+            log_debug(f"[Server] Letras com timing real por palavra aplicadas para '{target_title}' ({len(wordsync)} versos)")
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log_debug(f"[Server] Erro no wordsync: {e}")
 
     async def check_lyrics_worker(self, target_title):
         delays = [0, 2, 4, 6, 10, 15]
@@ -55,10 +109,6 @@ class WebSocketServerController:
                     self.state.set_lyrics(lyrics)
                     log_debug(f"[Server] Letras carregadas com sucesso para '{target_title}' ({len(lyrics)} versos)")
 
-                    # Dispara tradução assíncrona em background
-                    if self.current_translate_task and not self.current_translate_task.done():
-                        self.current_translate_task.cancel()
-                    self.current_translate_task = asyncio.create_task(self.translate_worker(target_title, list(lyrics)))
                     return
         except asyncio.CancelledError:
             pass
@@ -75,6 +125,8 @@ class WebSocketServerController:
                 if data.get("closed"):
                     GLOBAL_SIGNALS.stop_playback.emit()
                     continue
+
+                self.maybe_start_translation()
 
                 raw_title = data.get("title", "")
                 raw_artist = data.get("artist", "")
@@ -109,6 +161,11 @@ class WebSocketServerController:
                     if self.current_fetch_task and not self.current_fetch_task.done():
                         self.current_fetch_task.cancel()
                     self.current_fetch_task = asyncio.create_task(self.check_lyrics_worker(title))
+
+                    # Em paralelo: timing real por palavra (lento, substitui as letras se chegar)
+                    if self.current_wordsync_task and not self.current_wordsync_task.done():
+                        self.current_wordsync_task.cancel()
+                    self.current_wordsync_task = asyncio.create_task(self.wordsync_worker(title))
                 else:
                     if artwork_url:
                         self.ui_widget.trigger_artwork_download(artwork_url)

@@ -99,6 +99,7 @@ class PlayerStateManager:
         self.lyrics = []
         self.translations = {}  # index -> texto em portugues
         self.translate_enabled = False
+        self.line2_is_translation = False
         self.median_verse_gap = 3.5
 
         self.last_sync_audio_time = 0.0
@@ -176,6 +177,30 @@ class PlayerStateManager:
     def is_timed_out(self):
         return (time.perf_counter() - self.last_heartbeat_time) > 10.0
 
+    @staticmethod
+    def _progress_from_breakpoints(breakpoints, current_time, text):
+        """Progresso (0..1) a partir de timestamps reais da API.
+        Com tempo por palavra: interpola entre os pontos (tempo, posição do caractere).
+        Só com início/fim do verso (2 pontos): usa o ritmo estimado dentro da janela real cantada."""
+        text_len = len(text)
+        if not breakpoints or text_len <= 0:
+            return 0.0
+        if current_time <= breakpoints[0][0]:
+            return 0.0
+        if len(breakpoints) == 2:
+            t0, t1 = breakpoints[0][0], breakpoints[1][0]
+            if current_time >= t1:
+                return 1.0
+            return calculate_rhythm_progress(text, (current_time - t0) / max(0.2, t1 - t0))
+        for k in range(len(breakpoints) - 1):
+            t0, c0 = breakpoints[k]
+            t1, c1 = breakpoints[k + 1]
+            if current_time <= t1:
+                frac = 1.0 if t1 <= t0 else (current_time - t0) / (t1 - t0)
+                char_pos = c0 + frac * (c1 - c0)
+                return max(0.0, min(1.0, char_pos / text_len))
+        return 1.0
+
     def _get_next_sung_text(self, start_idx):
         for j in range(start_idx, len(self.lyrics)):
             t = self.lyrics[j]["text"].strip()
@@ -188,6 +213,7 @@ class PlayerStateManager:
         if not self.has_track or not self.title:
             return ("", "", 0.0, True)
 
+        self.line2_is_translation = False
         current_time = self.get_interpolated_time()
 
         # 1. Sem letras disponíveis -> Modo Card Limpo (Título + Artista)
@@ -231,7 +257,11 @@ class PlayerStateManager:
         secondary_text = ""
         if getattr(self, "translate_enabled", False):
             secondary_text = self.translations.get(active_idx, "")
+            # Tradução igual ao verso original = não traduzida: trata como ausente
+            if secondary_text and re.sub(r"[^\w\s]", "", secondary_text.lower()).strip() == re.sub(r"[^\w\s]", "", current_text.lower()).strip():
+                secondary_text = ""
             # Se não houver tradução específica ou for instrumental, usa fallback elegante
+            self.line2_is_translation = bool(secondary_text)
             if not secondary_text and current_text != "♪":
                 secondary_text = self._get_next_sung_text(active_idx + 1) if not is_last else ""
         else:
@@ -246,6 +276,7 @@ class PlayerStateManager:
             if current_text == "♪":
                 solo_prog = max(0.0, min(1.0, (current_time - start_time) / max(0.2, gap)))
                 line2_display = "♪" if getattr(self, "translate_enabled", False) else self._get_next_sung_text(active_idx + 1)
+                self.line2_is_translation = bool(getattr(self, "translate_enabled", False))
                 return ("♪", line2_display, solo_prog, False)
 
             # Caso 2: Verso cantado
@@ -253,6 +284,10 @@ class PlayerStateManager:
             words = current_text.split()
             word_count = max(1, len(words))
             char_count = len(current_text)
+
+            # Timing real por palavra (richsync do Musixmatch), quando disponível para este verso.
+            # Substitui a estimativa heurística por timestamps reais de início/fim de cada palavra.
+            bp = self.lyrics[active_idx].get("words")
 
             # Ritmo base da música específica:
             base_tempo = max(1.5, getattr(self, "median_verse_gap", 3.5))
@@ -262,9 +297,13 @@ class PlayerStateManager:
             is_huge_solo_break = (gap >= max(8.0, base_tempo * 2.5))
 
             if is_huge_solo_break:
-                # Canto com tempo natural e depois transita para solo de verdade
-                text_ratio = max(0.8, min(1.6, (word_count * 0.35 + char_count * 0.04) / 3.0))
-                singing_time = max(2.0, min(base_tempo * text_ratio, gap - 4.0))
+                if bp:
+                    # Fim real do canto reportado pela API: usa diretamente, sem estimar.
+                    singing_time = max(0.3, bp[-1][0] - start_time)
+                else:
+                    # Canto com tempo natural e depois transita para solo de verdade
+                    text_ratio = max(0.8, min(1.6, (word_count * 0.35 + char_count * 0.04) / 3.0))
+                    singing_time = max(2.0, min(base_tempo * text_ratio, gap - 4.0))
                 hold_time = 0.8
                 instrumental_start = start_time + singing_time + hold_time
                 instrumental_duration = end_time - instrumental_start
@@ -272,19 +311,41 @@ class PlayerStateManager:
                 if current_time >= instrumental_start and instrumental_duration >= 3.0:
                     solo_prog = max(0.0, min(1.0, (current_time - instrumental_start) / max(0.2, instrumental_duration)))
                     line2_display = "♪" if getattr(self, "translate_enabled", False) else self._get_next_sung_text(active_idx + 1)
+                    self.line2_is_translation = bool(getattr(self, "translate_enabled", False))
                     return ("♪", line2_display, solo_prog, False)
                 else:
                     time_in_verse = current_time - start_time
+                    if bp:
+                        rhythm_prog = self._progress_from_breakpoints(bp, current_time, current_text)
+                    else:
+                        linear_prog = max(0.0, min(1.0, time_in_verse / max(0.2, singing_time)))
+                        rhythm_prog = calculate_rhythm_progress(current_text, linear_prog)
+                    return (current_text, next_sung, rhythm_prog, False)
+            elif bp:
+                # Timing real por palavra: a API já informa quando o verso termina de verdade,
+                # então qualquer sobra até o próximo verso é silêncio/instrumental de fato e a
+                # linha simplesmente fica totalmente preenchida enquanto espera.
+                rhythm_prog = self._progress_from_breakpoints(bp, current_time, current_text)
+                return (current_text, next_sung, rhythm_prog, False)
+            else:
+                # Verso normal: estima a duração natural do canto a partir do texto
+                # (palavras/caracteres) e do ritmo típico da música. Se sobrar uma pausa
+                # real depois disso (ex: um trecho de instrumental antes do próximo verso),
+                # essa sobra NÃO é tratada como parte do canto — a linha fica totalmente
+                # preenchida e aguarda o próximo verso, em vez de "arrastar" o preenchimento
+                # até o fim do intervalo (o que fazia o karaokê parecer atrasado).
+                text_ratio = max(0.8, min(1.6, (word_count * 0.35 + char_count * 0.04) / 3.0))
+                natural_singing = max(0.6, min(gap - 0.15, base_tempo * text_ratio))
+                pause_after = gap - natural_singing
+
+                singing_time = natural_singing if pause_after >= 1.0 else max(0.4, gap - 0.15)
+
+                time_in_verse = current_time - start_time
+                if time_in_verse >= singing_time:
+                    rhythm_prog = 1.0
+                else:
                     linear_prog = max(0.0, min(1.0, time_in_verse / max(0.2, singing_time)))
                     rhythm_prog = calculate_rhythm_progress(current_text, linear_prog)
-                    return (current_text, next_sung, rhythm_prog, False)
-            else:
-                # Verso normal: a voz preenche todo o intervalo da estrofe
-                # Deixa apenas uma fração de 0.15s no final para transição fluida para o próximo verso
-                singing_time = max(0.4, gap - 0.15)
-                time_in_verse = current_time - start_time
-                linear_prog = max(0.0, min(1.0, time_in_verse / max(0.2, singing_time)))
-                rhythm_prog = calculate_rhythm_progress(current_text, linear_prog)
                 return (current_text, next_sung, rhythm_prog, False)
 
 
@@ -301,13 +362,21 @@ class PlayerStateManager:
             words = current_text.split()
             word_count = max(1, len(words))
             char_count = len(current_text)
-            singing_time = max(1.5, word_count * 0.35 + char_count * 0.040)
+            bp = self.lyrics[active_idx].get("words")
+            if bp:
+                singing_time = max(0.3, bp[-1][0] - start_time)
+            else:
+                singing_time = max(1.5, word_count * 0.35 + char_count * 0.040)
 
             time_in_verse = current_time - start_time
             last_line2 = secondary_text if (getattr(self, "translate_enabled", False) and secondary_text) else (self.artist or self.title)
+            self.line2_is_translation = bool(getattr(self, "translate_enabled", False) and secondary_text)
             if time_in_verse < (singing_time + 8.0):
-                linear_prog = max(0.0, min(1.0, time_in_verse / max(0.2, singing_time)))
-                rhythm_prog = calculate_rhythm_progress(current_text, linear_prog)
+                if bp:
+                    rhythm_prog = self._progress_from_breakpoints(bp, current_time, current_text)
+                else:
+                    linear_prog = max(0.0, min(1.0, time_in_verse / max(0.2, singing_time)))
+                    rhythm_prog = calculate_rhythm_progress(current_text, linear_prog)
                 return (current_text, last_line2, rhythm_prog, False)
             else:
                 return (self.title, self.artist, 1.0, True)

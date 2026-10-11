@@ -51,7 +51,7 @@ class KaraokeLineWidget(QWidget):
 
         self.font_main = QFont("SF Pro Display", 11, QFont.Weight.Bold)
         self.font_main.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
-        self.font_symbol = QFont("Segoe UI Emoji", 13, QFont.Weight.Bold)
+        self.font_symbol = QFont("Microsoft YaHei UI", 13, QFont.Weight.Bold)
         self.font_symbol.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
         self.font_next = QFont("SF Pro Display", 9, QFont.Weight.DemiBold)
         self.font_next.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
@@ -682,5 +682,6 @@ class TaskbarLyricsWidget(QWidget):
             return
 
         l1, l2, prog, is_card = self.state.get_display_state()
-        is_trans = getattr(self.state, "translate_enabled", False)
+        # Preenchimento da 2a linha só quando ela é a tradução do verso atual (ou card/nota simétrica)
+        is_trans = bool(getattr(self.state, "line2_is_translation", False) or (is_card and getattr(self.state, "translate_enabled", False)))
         self.karaoke_widget.set_state(l1, l2, prog, is_card, is_trans)
