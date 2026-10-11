@@ -19,3 +19,6 @@ node_modules/
 venv/
 .venv/
 env/
+
+# Cache de traducoes (gerado em runtime)
+translation_cache.json

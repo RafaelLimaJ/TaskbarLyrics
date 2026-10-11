@@ -1,4 +1,6 @@
+import os
 import re
+import time
 import json
 import urllib.request
 import urllib.parse
@@ -6,7 +8,7 @@ import urllib.error
 import unicodedata
 import threading
 import concurrent.futures
-from config import log_debug
+from config import log_debug, BASE_DIR
 
 def normalize_text(text):
     if not text:
@@ -104,59 +106,99 @@ def is_fake_synced_lyrics(parsed_lines):
 # CACHE EM RAM (0ms)
 # ---------------------------------------------------------
 _lyrics_cache = {}
-_translation_cache = {}
+TRANSLATION_CACHE_FILE = os.path.join(BASE_DIR, "translation_cache.json")
+# Dois clientes do mesmo serviço, com cota separada: se um toma 429 o outro assume
+TRANSLATE_CLIENTS = ("dict-chrome-ex", "gtx")
+_translate_blocked_until = {c: 0.0 for c in TRANSLATE_CLIENTS}
+_translate_lock = threading.Lock()
+
+def _line_key(text):
+    return re.sub(r"[^\w\s]", "", text.lower()).strip()
+
+def _load_translation_cache():
+    try:
+        with open(TRANSLATION_CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def _save_translation_cache():
+    try:
+        items = list(_line_translation_cache.items())[-20000:]
+        with open(TRANSLATION_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(dict(items), f, ensure_ascii=False)
+    except Exception as e:
+        log_debug(f"[Tradutor] Não foi possível salvar o cache de traduções: {e}")
+
+_line_translation_cache = _load_translation_cache()
+
+def _request_translation(text):
+    """Traduz um bloco de linhas; tenta cada cliente que não esteja em pausa por 429."""
+    last_error = None
+    for client in TRANSLATE_CLIENTS:
+        if time.time() < _translate_blocked_until[client]:
+            continue
+        try:
+            url = f"https://translate.googleapis.com/translate_a/single?client={client}&sl=auto&tl=pt&dt=t&q=" + urllib.parse.quote(text)
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            return "".join([part[0] for part in data[0] if part and part[0]])
+        except urllib.error.HTTPError as e:
+            last_error = e
+            if e.code == 429:
+                _translate_blocked_until[client] = time.time() + 300
+                log_debug(f"[Tradutor] Cliente '{client}' limitado (429). Pausando por 5 min.")
+        except Exception as e:
+            last_error = e
+    if last_error:
+        raise last_error
+    raise RuntimeError("todos os clientes de tradução estão em pausa")
 
 def translate_lyrics_to_pt(lines):
-    """Traduz as linhas da letra para português de forma síncrona/em lote sem alterar os tempos originais."""
+    """Traduz as linhas da letra para português em lote, sem alterar os tempos originais.
+    Versos que não foram traduzidos (erro/bloqueio do Google) ficam FORA do mapa, nunca com o texto original."""
     if not lines:
         return {}
 
-    # Chave de cache baseada nas primeiras linhas
-    cache_key = "___".join(l["text"] for l in lines[:10])
-    if cache_key in _translation_cache:
-        return _translation_cache[cache_key]
-
     translated_map = {}
-    to_translate = []
-    indices = []
+    pending = []
 
     for idx, item in enumerate(lines):
         txt = item["text"].strip()
         if not txt or txt == "♪" or re.match(r"^[\s\(\[\{]*(instrumental|music|música|solo|♪|♫)[\s\)\]\}]*$", txt, re.IGNORECASE):
             translated_map[idx] = ""
+            continue
+        cached = _line_translation_cache.get(_line_key(txt))
+        if cached:
+            translated_map[idx] = cached
         else:
-            indices.append(idx)
-            to_translate.append(txt)
+            pending.append((idx, txt))
 
-    if not to_translate:
-        _translation_cache[cache_key] = translated_map
-        return translated_map
-
-    # Tradução em lotes de até 25 versos por requisição
-    chunk_size = 25
-    for start_i in range(0, len(to_translate), chunk_size):
-        chunk_texts = to_translate[start_i:start_i + chunk_size]
-        chunk_indices = indices[start_i:start_i + chunk_size]
-
-        try:
-            combined = "\n".join(chunk_texts)
-            url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=pt&dt=t&q=" + urllib.parse.quote(combined)
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-            with urllib.request.urlopen(req, timeout=3.5) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                translated_full = "".join([part[0] for part in data[0] if part and part[0]])
+    # Lotes de até 50 versos por requisição (só do que ainda não está em cache), com pausa entre eles
+    chunk_size = 50
+    with _translate_lock:
+        for start_i in range(0, len(pending), chunk_size):
+            chunk = pending[start_i:start_i + chunk_size]
+            try:
+                translated_full = _request_translation("\n".join(txt for _, txt in chunk))
                 translated_lines = translated_full.split("\n")
+                if len(translated_lines) != len(chunk):
+                    raise ValueError("lote de tradução desalinhado")
 
-                for orig_idx, t_line in zip(chunk_indices, translated_lines):
-                    translated_map[orig_idx] = t_line.strip()
-        except Exception as e:
-            log_debug(f"[Tradutor] Erro no lote de tradução: {e}")
-            for orig_idx, orig_text in zip(chunk_indices, chunk_texts):
-                if orig_idx not in translated_map:
-                    translated_map[orig_idx] = orig_text
+                for (orig_idx, orig_txt), t_line in zip(chunk, translated_lines):
+                    t_line = t_line.strip()
+                    translated_map[orig_idx] = t_line
+                    _line_translation_cache[_line_key(orig_txt)] = t_line
+                _save_translation_cache()
+            except Exception as e:
+                log_debug(f"[Tradutor] Lote não traduzido ({e}).")
+                break
+            if start_i + chunk_size < len(pending):
+                time.sleep(0.8)
 
-    _translation_cache[cache_key] = translated_map
-    log_debug(f"[Tradutor] {len(translated_map)} versos traduzidos para português.")
+    log_debug(f"[Tradutor] {sum(1 for v in translated_map.values() if v)} versos traduzidos para português.")
     return translated_map
 
 # ---------------------------------------------------------
@@ -226,6 +268,128 @@ def check_and_rescale_lyrics(parsed_lines, user_duration, item_duration, cand_ti
         return scaled
     return parsed_lines
 
+def overruns_duration(parsed_lines, duration, tempo_modified=False):
+    """Letra cuja última linha passa da duração da música = timestamps inválidos (ex: espaçamento sintético)."""
+    if tempo_modified or duration <= 30 or not parsed_lines:
+        return False
+    return parsed_lines[-1]["time"] > duration + 8
+
+# ---------------------------------------------------------
+# TIMING REAL POR PALAVRA (LiriQo: Apple Music / QQ / KuGou)
+# Fonte opcional e lenta (8-13s): chega depois do LRCLIB e substitui as letras
+# se trouxer início/fim reais de cada palavra. Se falhar, nada muda.
+# ---------------------------------------------------------
+LIRIQO_URL = "https://api.liriqo-alfarrizi.my.id/v1/lyrics?"
+WORDSYNC_PROVIDERS = ("golyrics_apple_music", "qq_portato", "kugou_legato", "amlyrics_apple_music", "binimum_apple_music")
+_wordsync_cache = {}
+
+def artist_names(name):
+    """Separa 'A e B', 'A, B', 'A & B', 'A feat. B' em nomes normalizados (colaborações)."""
+    parts = re.split(r",|&|/|\s+e\s+|\s+and\s+|\s+x\s+|\s+(?:feat|ft|part|com|with)\.?\s+", normalize_text(name or "").lower())
+    return [p.strip() for p in parts if len(p.strip()) > 1]
+
+def parse_wordsync_lines(timed):
+    """Converte linhas do LiriQo (ms) em {"time","text","words":[(tempo_s, pos_caractere)...]}."""
+    lines = []
+    for ln in timed:
+        try:
+            ts = float(ln["start"]) / 1000.0
+            te = float(ln["end"]) / 1000.0
+        except (KeyError, TypeError, ValueError):
+            continue
+        text = (ln.get("text") or "").strip()
+        if not text or ln.get("isInstrumental"):
+            lines.append({"time": ts, "text": "♪"})
+            continue
+
+        points = []
+        search_from = 0
+        for w in ln.get("words") or []:
+            chunk = (w.get("text") or "").strip()
+            if not chunk:
+                continue
+            idx = text.find(chunk, search_from)
+            if idx == -1:
+                points = []
+                break
+            points.append((round(float(w["start"]) / 1000.0, 3), idx))
+            search_from = idx + len(chunk)
+
+        line = {"time": ts, "text": text}
+        if points:
+            if points[0] != (ts, 0):
+                points.insert(0, (ts, 0))
+            line["words"] = points + [(max(te, points[-1][0]), len(text))]
+        elif te > ts:
+            # Só início/fim reais do verso (Apple Music por linha): 2 pontos
+            line["words"] = [(ts, 0), (te, len(text))]
+        lines.append(line)
+
+    lines.sort(key=lambda x: x["time"])
+    return lines
+
+def fetch_wordsync_lyrics_sync(track_name, artist_name, duration, reference_lines=None):
+    if not artist_name or is_tempo_modified(track_name):
+        return None
+    query = re.sub(r"\s*[\(\[]\s*(?:with|part\.?|feat\.?|ft\.?)\b[^)\]]*[\)\]]", "", clean_title(track_name), flags=re.IGNORECASE).strip()
+    wanted = artist_names(artist_name)
+    if not query or not wanted:
+        return None
+    clean_artist = wanted[0]
+
+    cache_key = f"{query}___{clean_artist}___{int(duration) if duration > 0 else 0}"
+    if cache_key in _wordsync_cache:
+        return _wordsync_cache[cache_key]
+
+    try:
+        params = {"title": query, "artist": clean_artist}
+        if 0 < duration <= 600:
+            params["duration"] = int(duration)
+        req = urllib.request.Request(LIRIQO_URL + urllib.parse.urlencode(params), headers={"User-Agent": "TaskbarLyrics/3.0 (Windows 11)"})
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        log_debug(f"[WordSync] LiriQo indisponível, mantendo letras por linha: {e}")
+        return None
+
+    tracks = {t.get("provider"): t for t in data.get("tracks", [])}
+    # 1ª passada: só provedores com tempo por palavra; 2ª: aceita só início/fim reais do verso
+    attempts = [(p, True) for p in WORDSYNC_PROVIDERS] + [(p, False) for p in WORDSYNC_PROVIDERS]
+    for provider, need_words in attempts:
+        track = tracks.get(provider)
+        timed = track.get("timed") if track else None
+        if not timed or len(timed) < 3:
+            continue
+        # Algum artista da resposta precisa bater com algum do pedido (evita música homônima de outro artista)
+        got = artist_names(track.get("artist", ""))
+        if got and not any(w in g or g in w for w in wanted for g in got):
+            continue
+        # Provedor sem tempos de verdade (ex: tudo 0)
+        if sum(1 for l in timed if (l.get("end") or 0) <= (l.get("start") or 0)) > len(timed) / 3:
+            continue
+        parsed = parse_wordsync_lines(timed)
+        if is_fake_synced_lyrics(parsed) or overruns_duration(parsed, duration):
+            continue
+        min_points = 2 if need_words else 1
+        if sum(1 for l in parsed if len(l.get("words", [])) > min_points) < len(parsed) * 0.6:
+            continue
+        # Sem letra de referência: a letra tem que cobrir a música (descarta homônimas bem mais curtas)
+        if not reference_lines and duration > 30 and parsed[-1]["time"] < duration - 100:
+            continue
+        # Se já temos letra do LRCLIB, a primeira linha tem que cair perto (mesma versão da música)
+        if reference_lines:
+            ref_first = next((l["time"] for l in reference_lines if l["text"] != "♪"), None)
+            new_first = next((l["time"] for l in parsed if l["text"] != "♪"), None)
+            if ref_first is not None and new_first is not None and abs(ref_first - new_first) > 4.0:
+                log_debug(f"[WordSync] {provider} descartado: início em {new_first:.1f}s vs {ref_first:.1f}s do LRCLIB")
+                continue
+        log_debug(f"[WordSync] {provider}: {len(parsed)} versos com timing real por palavra.")
+        _wordsync_cache[cache_key] = parsed
+        return parsed
+
+    log_debug("[WordSync] Sem timing por palavra confiável para esta música.")
+    return None
+
 # ---------------------------------------------------------
 # MOTOR DE BUSCA CONCORRENTE PARALELO
 # ---------------------------------------------------------
@@ -271,7 +435,7 @@ def fetch_synced_lyrics_sync(track_name, artist_name="", duration=0):
                     synced = data.get("syncedLyrics")
                     if synced:
                         parsed = parse_lrc(synced)
-                        if not is_fake_synced_lyrics(parsed):
+                        if not is_fake_synced_lyrics(parsed) and not overruns_duration(parsed, duration, is_tempo_modified(data.get("trackName", ""), data.get("albumName", ""), raw_query)):
                             item_dur = data.get("duration", 0)
                             cand_track = data.get("trackName", "")
                             cand_album = data.get("albumName", "")
@@ -293,7 +457,7 @@ def fetch_synced_lyrics_sync(track_name, artist_name="", duration=0):
                         synced = data.get("syncedLyrics")
                         if synced:
                             parsed = parse_lrc(synced)
-                            if not is_fake_synced_lyrics(parsed):
+                            if not is_fake_synced_lyrics(parsed) and not overruns_duration(parsed, duration, is_tempo_modified(data.get("trackName", ""), data.get("albumName", ""), raw_query)):
                                 item_dur = data.get("duration", 0)
                                 cand_track = data.get("trackName", "")
                                 cand_album = data.get("albumName", "")
@@ -340,6 +504,11 @@ def fetch_synced_lyrics_sync(track_name, artist_name="", duration=0):
 
                         item_dur = item.get("duration", 0)
                         diff = abs(item_dur - duration) if duration > 0 and item_dur else 0
+                        # Duração muito diferente = outra música com título parecido (versões sped up/slowed são reescaladas depois)
+                        if diff > 20 and not (cand_has_tempo or query_has_tempo):
+                            continue
+                        if overruns_duration(parsed, duration, cand_has_tempo or query_has_tempo):
+                            continue
                         has_intro = 1 if parsed[0]["time"] > 1.0 else 0
                         is_video = 1 if "video" in item_track else 0
                         candidates.append((tempo_mismatch, diff, is_video, -has_intro, parsed, item))
