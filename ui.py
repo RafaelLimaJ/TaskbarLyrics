@@ -1,5 +1,6 @@
 import os
 import time
+from functools import lru_cache
 import urllib.request
 import threading
 from PyQt6.QtWidgets import (
@@ -34,6 +35,49 @@ class UISignals(QObject):
 
 GLOBAL_SIGNALS = UISignals()
 
+# Cor do preenchimento por tipo de sincronização (word = timing real por palavra): bem suave sobre o branco
+FILL_COLORS = {"word": (205, 255, 228), "verse": (255, 255, 255), "estimate": (255, 255, 255)}
+BG_COLOR = (140, 200, 255)   # cor do trecho entre parênteses (backing vocals / outro cantor)
+
+
+@lru_cache(maxsize=512)
+def parse_runs(text):
+    """Remove os parênteses e marca o trecho interno como 'secundário'.
+    Retorna (texto_exibido, runs[(ini, fim, secundario)], mapa orig->exibido, mantido[orig])."""
+    if "(" not in text and ")" not in text:
+        return text, ((0, len(text), False),), None, None
+    disp = []
+    kept = []
+    mapping = []
+    kinds = []
+    depth = 0
+    for ch in text:
+        mapping.append(len(disp))
+        if ch == "(":
+            depth += 1
+            kept.append(False)
+            continue
+        if ch == ")":
+            depth = max(0, depth - 1)
+            kept.append(False)
+            continue
+        is_bg = depth > 0
+        if disp and kinds[-1] != is_bg and disp[-1] != " " and ch not in " ,.!?;:":
+            disp.append(" ")
+            kinds.append(kinds[-1])
+        disp.append(ch)
+        kinds.append(is_bg)
+        kept.append(True)
+    mapping.append(len(disp))
+    runs = []
+    for i, k in enumerate(kinds):
+        if runs and runs[-1][2] == k:
+            runs[-1] = (runs[-1][0], i + 1, k)
+        else:
+            runs.append((i, i + 1, k))
+    return "".join(disp), tuple(runs), tuple(mapping), tuple(kept)
+
+
 class KaraokeLineWidget(QWidget):
     """Widget de texto com renderização dupla, slide-up animado e preenchimento karaokê a 60 FPS."""
 
@@ -45,6 +89,7 @@ class KaraokeLineWidget(QWidget):
         self.progress = 0.0
         self.is_card_mode = False
         self.is_translate_mode = False
+        self.sync_mode = "estimate"
 
         self.transition_start_time = 0.0
         self.transition_duration = 0.24  # 240ms cubic ease
@@ -58,6 +103,7 @@ class KaraokeLineWidget(QWidget):
 
     def set_state(self, current_text, next_text, progress, is_card_mode, is_translate_mode=False):
         text_changed = (self.current_text != current_text)
+        next_text = next_text.replace("(", "").replace(")", "")
 
         if text_changed and not is_card_mode and not self.is_card_mode and self.current_text:
             self.prev_text = self.current_text
@@ -84,6 +130,48 @@ class KaraokeLineWidget(QWidget):
             painter.drawText(x + 1, y + 1, text)
         painter.setPen(text_color)
         painter.drawText(x, y, text)
+
+    def _draw_main_text(self, painter, y, text, font, alpha, shadow_alpha):
+        """Linha principal (camada apagada), sem parênteses e com cor própria no trecho secundário."""
+        disp, runs, _, _ = parse_runs(text)
+        if len(runs) == 1 and not runs[0][2]:
+            self._draw_text_with_shadow(painter, 0, y, disp, font, QColor(255, 255, 255, alpha), shadow_alpha)
+            return
+        fm = QFontMetrics(font)
+        for start, end, is_bg in runs:
+            x = fm.horizontalAdvance(disp[:start])
+            r, g, b = BG_COLOR if is_bg else (255, 255, 255)
+            self._draw_text_with_shadow(painter, x, y, disp[start:end], font, QColor(r, g, b, alpha), shadow_alpha)
+
+    def _fill_width(self, text, font, progress):
+        """Posição em pixels do preenchimento: o progresso é uma posição de caractere no texto original."""
+        disp, _, mapping, kept = parse_runs(text)
+        fm = QFontMetrics(font)
+        if mapping is None:
+            return int(fm.horizontalAdvance(disp) * progress)
+        pos = max(0.0, min(1.0, progress)) * len(text)
+        i = int(pos)
+        if i >= len(text):
+            return fm.horizontalAdvance(disp) + 2
+        d0 = mapping[i]
+        w = fm.horizontalAdvance(disp[:d0])
+        if kept[i] and d0 < len(disp):
+            w += (pos - i) * fm.horizontalAdvance(disp[d0])
+        return int(w)
+
+    def _draw_main_fill(self, painter, y, text, font, progress):
+        disp, runs, _, _ = parse_runs(text)
+        fill_w = self._fill_width(text, font, progress)
+        fm = QFontMetrics(font)
+        painter.save()
+        painter.setClipRect(0, y - 16, fill_w, 24)
+        for start, end, is_bg in runs:
+            x = fm.horizontalAdvance(disp[:start])
+            r, g, b = BG_COLOR if is_bg else FILL_COLORS.get(self.sync_mode, (255, 255, 255))
+            painter.setFont(font)
+            painter.setPen(QColor(r, g, b, 255))
+            painter.drawText(x, y, disp[start:end])
+        painter.restore()
 
     def paintEvent(self, event):
         if not self.current_text and not self.next_text:
@@ -118,7 +206,7 @@ class KaraokeLineWidget(QWidget):
             prev_alpha = int(255 * (1.0 - ease))
             if prev_alpha > 5:
                 s_alpha = int(150 * (1.0 - ease))
-                self._draw_text_with_shadow(painter, 0, 16 - delta_y, self.prev_text, self.font_main, QColor(255, 255, 255, prev_alpha), s_alpha)
+                self._draw_main_text(painter, 16 - delta_y, self.prev_text, self.font_main, prev_alpha, s_alpha)
 
             # 2. Nova linha sobe para a posição principal
             curr_y = 32 - delta_y
@@ -126,12 +214,12 @@ class KaraokeLineWidget(QWidget):
             s_alpha = int(180 * ease)
             is_note_trans = (self.current_text.strip() == "♪")
             active_font_trans = self.font_symbol if is_note_trans else self.font_main
-            self._draw_text_with_shadow(painter, 0, curr_y, self.current_text, active_font_trans, QColor(255, 255, 255, curr_alpha), s_alpha)
+            self._draw_main_text(painter, curr_y, self.current_text, active_font_trans, curr_alpha, s_alpha)
 
             # Preenchimento enquanto sobe
             if self.progress > 0.0:
                 fm = QFontMetrics(active_font_trans)
-                tw = fm.horizontalAdvance(self.current_text)
+                tw = fm.horizontalAdvance(parse_runs(self.current_text)[0])
                 if tw > 0:
                     if is_note_trans:
                         note_h = 24
@@ -144,13 +232,7 @@ class KaraokeLineWidget(QWidget):
                         painter.drawText(0, curr_y, self.current_text)
                         painter.restore()
                     else:
-                        act_w = int(tw * self.progress)
-                        painter.save()
-                        painter.setClipRect(0, curr_y - 14, act_w, 22)
-                        painter.setFont(active_font_trans)
-                        painter.setPen(QColor(255, 255, 255, 255))
-                        painter.drawText(0, curr_y, self.current_text)
-                        painter.restore()
+                        self._draw_main_fill(painter, curr_y, self.current_text, active_font_trans, self.progress)
 
 
             # 3. Próximo verso entra embaixo (ou tradução com karaokê)
@@ -194,7 +276,7 @@ class KaraokeLineWidget(QWidget):
         active_font = self.font_symbol if is_note else self.font_main
 
         fm = QFontMetrics(active_font)
-        text_w = fm.horizontalAdvance(self.current_text)
+        text_w = fm.horizontalAdvance(parse_runs(self.current_text)[0])
 
         offset_x = 0
         if text_w > avail_w:
@@ -204,7 +286,7 @@ class KaraokeLineWidget(QWidget):
         painter.save()
         painter.translate(offset_x, 0)
         # Linha principal com sombra para garantir leitura
-        self._draw_text_with_shadow(painter, 0, line_y, self.current_text, active_font, QColor(255, 255, 255, 140), 160)
+        self._draw_main_text(painter, line_y, self.current_text, active_font, 140, 160)
 
         if self.progress > 0.0 and text_w > 0:
             if is_note:
@@ -219,11 +301,7 @@ class KaraokeLineWidget(QWidget):
                 painter.drawText(0, line_y, self.current_text)
             else:
                 # Texto normal preenche da esquerda para a direita
-                active_w = int(text_w * self.progress)
-                painter.setClipRect(0, 0, active_w, 24)
-                painter.setFont(active_font)
-                painter.setPen(QColor(255, 255, 255, 255))
-                painter.drawText(0, line_y, self.current_text)
+                self._draw_main_fill(painter, line_y, self.current_text, active_font, self.progress)
         painter.restore()
 
         # 2. SEGUNDA LINHA (Tradução com karaokê em branco puro OU Próximo Verso estático)
@@ -682,6 +760,7 @@ class TaskbarLyricsWidget(QWidget):
             return
 
         l1, l2, prog, is_card = self.state.get_display_state()
+        self.karaoke_widget.sync_mode = getattr(self.state, "sync_mode", "estimate")
         # Preenchimento da 2a linha só quando ela é a tradução do verso atual (ou card/nota simétrica)
         is_trans = bool(getattr(self.state, "line2_is_translation", False) or (is_card and getattr(self.state, "translate_enabled", False)))
         self.karaoke_widget.set_state(l1, l2, prog, is_card, is_trans)

@@ -102,6 +102,7 @@ class PlayerStateManager:
         self.line2_is_translation = False
         self.median_verse_gap = 3.5
         self.voice_detector = None
+        self.sync_mode = "estimate"   # "word" | "verse" | "estimate"
         self._voice_idx = -1
         self._voice_end = None
         self._voice_solo = False
@@ -140,6 +141,7 @@ class PlayerStateManager:
 
         if is_different:
             self.lyrics = []
+            self.sync_mode = "estimate"
             self.translations = {}
             self.median_verse_gap = 3.5
             self._voice_idx = -1
@@ -151,6 +153,14 @@ class PlayerStateManager:
 
     def set_lyrics(self, lyrics):
         self.lyrics = lyrics
+        with_words = [l for l in lyrics if l.get("words")]
+        real_words = [l for l in with_words if len(l["words"]) > 2]
+        if lyrics and len(real_words) >= len(lyrics) * 0.6:
+            self.sync_mode = "word"
+        elif lyrics and len(with_words) >= len(lyrics) * 0.6:
+            self.sync_mode = "verse"
+        else:
+            self.sync_mode = "estimate"
         # Calcula a mediana do intervalo dos versos desta música específica
         if len(lyrics) >= 2:
             gaps = []
@@ -214,8 +224,7 @@ class PlayerStateManager:
 
     def _apply_voice_detection(self, idx, start_time, current_time, prog):
         """Refina o preenchimento estimado usando a voz detectada no áudio (só em versos sem tempo real da API).
-        - Silêncio vocal sustentado perto do fim do verso => fecha o verso (instrumental não conta como canto).
-        - Voz ainda ativa com o verso quase completo => segura a última palavra até a voz parar."""
+        Silêncio vocal sustentado perto do fim do verso => fecha o verso (instrumental não conta como canto)."""
         det = self.voice_detector
         if det is None or not det.is_ready():
             return prog
@@ -235,8 +244,6 @@ class PlayerStateManager:
         if self._voice_end is not None:
             k = min(1.0, max(0.0, (current_time - self._voice_det_t) / 0.25))
             return max(prog, self._voice_p0 + (1.0 - self._voice_p0) * k)
-        if det.voiced() and prog > 0.93:
-            return 0.93
         return prog
 
     def _get_next_sung_text(self, start_idx):
