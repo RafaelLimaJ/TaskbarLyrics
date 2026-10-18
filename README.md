@@ -23,7 +23,7 @@ A sleek, lightweight, and hardware-accelerated synced lyrics and karaoke overlay
   - Transparent, frameless overlay using low-level Win32 hooks (WS_EX_LAYERED, WS_EX_TRANSPARENT, topmost persistence).
   - Auto-hides on pause/stop and appears instantly on playback.
 - **Zero-Latency Local WebSocket Bridge**: Direct communication between the browser extension and desktop widget at ws://127.0.0.1:5678.
-- **Multi-Source Synced Lyrics Engine**: High-speed concurrent lookups (LRCLIB, Musixmatch) with in-memory RAM caching.
+- **Multi-Source Synced Lyrics Engine**: Line-synced lyrics from LRCLIB, plus real word-by-word timing from several independent sources queried in parallel (Apple Music TTML via binimum/LyricsPlus, KuGou KRC, NetEase YRC, BetterLyrics, LiriQo as fallback), with per-source rate-limit handling and an on-disk cache.
 
 ---
 

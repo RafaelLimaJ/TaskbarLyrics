@@ -9,6 +9,7 @@ import unicodedata
 import threading
 import concurrent.futures
 from config import log_debug, BASE_DIR
+from wordsync_sources import collect_direct_tracks
 
 def normalize_text(text):
     if not text:
@@ -280,7 +281,7 @@ def overruns_duration(parsed_lines, duration, tempo_modified=False):
 # se trouxer início/fim reais de cada palavra. Se falhar, nada muda.
 # ---------------------------------------------------------
 LIRIQO_URL = "https://api.liriqo-alfarrizi.my.id/v1/lyrics?"
-WORDSYNC_PROVIDERS = ("golyrics_apple_music", "qq_portato", "kugou_legato", "amlyrics_apple_music", "binimum_apple_music")
+WORDSYNC_PROVIDERS = ("binimum_ttml", "lyricsplus", "golyrics_apple_music", "amlyrics_apple_music", "betterlyrics", "qq_portato", "kugou_direct", "kugou_legato", "netease_yrc", "binimum_apple_music")
 WORDSYNC_CACHE_FILE = os.path.join(BASE_DIR, "wordsync_cache.json")
 WORDSYNC_POSITIVE_TTL = 90 * 86400   # letra com timing real guardada por 90 dias
 WORDSYNC_NEGATIVE_TTL = 24 * 3600    # "sem timing para esta música" guardado por 1 dia
@@ -366,28 +367,22 @@ def parse_wordsync_lines(timed):
     lines.sort(key=lambda x: x["time"])
     return lines
 
-def fetch_wordsync_lyrics_sync(track_name, artist_name, duration, reference_lines=None):
-    if not artist_name or is_tempo_modified(track_name):
-        return None
-    query = re.sub(r"\s*[\(\[]\s*(?:with|part\.?|feat\.?|ft\.?)\b[^)\]]*[\)\]]", "", clean_title(track_name), flags=re.IGNORECASE).strip()
-    wanted = artist_names(artist_name)
-    if not query or not wanted:
-        return None
-    clean_artist = wanted[0]
+def _track_has_words(track):
+    timed = track.get("timed") or []
+    return bool(timed) and sum(1 for l in timed if l.get("words")) >= len(timed) * 0.6
 
+def _fetch_liriqo_tracks(query, clean_artist, duration):
+    """LiriQo (agregador): só consultado quando as fontes diretas não trazem timing por palavra.
+    Retorna (tracks | None, houve_erro)."""
     global _wordsync_last_block_log
-    cache_key = f"{query}___{clean_artist}___{int(duration) // 4 if duration > 0 else 0}"
     now = time.time()
     with _wordsync_lock:
-        entry = _wordsync_store["entries"].get(cache_key)
-        if entry and now - entry["t"] < (WORDSYNC_POSITIVE_TTL if entry["lines"] else WORDSYNC_NEGATIVE_TTL):
-            return _decode_wordsync_lines(entry["lines"]) if entry["lines"] else None
         blocked_until = _wordsync_store.get("blocked_until", 0.0)
     if now < blocked_until:
         if now - _wordsync_last_block_log > 60:
             _wordsync_last_block_log = now
             log_debug(f"[WordSync] LiriQo em pausa por limite de requisições; volta às {time.strftime('%H:%M', time.localtime(blocked_until))}.")
-        return None
+        return None, False
 
     try:
         params = {"title": query, "artist": clean_artist}
@@ -408,7 +403,7 @@ def fetch_wordsync_lyrics_sync(track_name, artist_name, duration, reference_line
             with _wordsync_lock:
                 _wordsync_store["blocked_until"] = resume
                 _save_wordsync_store()
-            log_debug(f"[WordSync] LiriQo atingiu o limite diário do plano gratuito (erro 1027). Volta às {time.strftime('%H:%M', time.localtime(resume))}; letras por linha até lá.")
+            log_debug(f"[WordSync] LiriQo atingiu o limite diário do plano gratuito (erro 1027). Volta às {time.strftime('%H:%M', time.localtime(resume))}.")
         elif e.code in (429, 403):
             with _wordsync_lock:
                 strikes = _wordsync_store.get("strikes", 0) + 1
@@ -416,21 +411,48 @@ def fetch_wordsync_lyrics_sync(track_name, artist_name, duration, reference_line
                 cooldown = WORDSYNC_COOLDOWNS[min(strikes - 1, len(WORDSYNC_COOLDOWNS) - 1)]
                 _wordsync_store["blocked_until"] = time.time() + cooldown
                 _save_wordsync_store()
-            log_debug(f"[WordSync] LiriQo limitou as requisições (HTTP {e.code}). Pausando por {cooldown // 60} min; letras por linha enquanto isso.")
+            log_debug(f"[WordSync] LiriQo limitou as requisições (HTTP {e.code}). Pausando por {cooldown // 60} min.")
         else:
-            log_debug(f"[WordSync] LiriQo indisponível (HTTP {e.code}), mantendo letras por linha.")
-        return None
+            log_debug(f"[WordSync] LiriQo indisponível (HTTP {e.code}).")
+        return None, True
     except Exception as e:
-        log_debug(f"[WordSync] LiriQo indisponível, mantendo letras por linha: {e}")
-        return None
+        log_debug(f"[WordSync] LiriQo indisponível: {e}")
+        return None, True
 
     with _wordsync_lock:
         if _wordsync_store.get("strikes", 0):
             _wordsync_store["strikes"] = 0
             _wordsync_store["blocked_until"] = 0.0
             _save_wordsync_store()
+    return {t.get("provider"): t for t in data.get("tracks", [])}, False
 
-    tracks = {t.get("provider"): t for t in data.get("tracks", [])}
+def fetch_wordsync_lyrics_sync(track_name, artist_name, duration, reference_lines=None):
+    if not artist_name or is_tempo_modified(track_name):
+        return None
+    query = re.sub(r"\s*[\(\[]\s*(?:with|part\.?|feat\.?|ft\.?)\b[^)\]]*[\)\]]", "", clean_title(track_name), flags=re.IGNORECASE).strip()
+    wanted = artist_names(artist_name)
+    if not query or not wanted:
+        return None
+    clean_artist = wanted[0]
+
+    cache_key = f"{query}___{clean_artist}___{int(duration) // 4 if duration > 0 else 0}"
+    now = time.time()
+    with _wordsync_lock:
+        entry = _wordsync_store["entries"].get(cache_key)
+        if entry:
+            ttl = entry.get("ttl") or (WORDSYNC_POSITIVE_TTL if entry["lines"] else WORDSYNC_NEGATIVE_TTL)
+            if now - entry["t"] < ttl:
+                return _decode_wordsync_lines(entry["lines"]) if entry["lines"] else None
+
+    # 1) fontes diretas em paralelo (Apple Music TTML, KuGou, NetEase, BetterLyrics)
+    tracks, had_error = collect_direct_tracks(query, wanted, duration)
+    # 2) LiriQo só se nenhuma delas trouxe timing por palavra
+    if not any(_track_has_words(t) for t in tracks.values()):
+        lq_tracks, lq_error = _fetch_liriqo_tracks(query, clean_artist, duration)
+        for name, t in (lq_tracks or {}).items():
+            tracks.setdefault(name, t)
+        had_error = had_error or lq_error
+
     # 1ª passada: só provedores com tempo por palavra; 2ª: aceita só início/fim reais do verso
     attempts = [(p, True) for p in WORDSYNC_PROVIDERS] + [(p, False) for p in WORDSYNC_PROVIDERS]
     for provider, need_words in attempts:
@@ -461,14 +483,18 @@ def fetch_wordsync_lyrics_sync(track_name, artist_name, duration, reference_line
             if ref_first is not None and new_first is not None and abs(ref_first - new_first) > 4.0:
                 log_debug(f"[WordSync] {provider} descartado: início em {new_first:.1f}s vs {ref_first:.1f}s do LRCLIB")
                 continue
-        log_debug(f"[WordSync] {provider}: {len(parsed)} versos com timing real por palavra.")
+        kind = "por palavra" if need_words else "início/fim do verso"
+        log_debug(f"[WordSync] {provider}: {len(parsed)} versos com timing real ({kind}).")
         with _wordsync_lock:
-            _wordsync_store["entries"][cache_key] = {"t": time.time(), "lines": parsed}
+            entry = {"t": time.time(), "lines": parsed}
+            if not need_words:
+                entry["ttl"] = 3 * 86400   # só fim de verso: tenta de novo em 3 dias (pode surgir timing por palavra)
+            _wordsync_store["entries"][cache_key] = entry
             _save_wordsync_store()
         return parsed
 
     with _wordsync_lock:
-        _wordsync_store["entries"][cache_key] = {"t": time.time(), "lines": None}
+        _wordsync_store["entries"][cache_key] = {"t": time.time(), "lines": None, "ttl": 600 if had_error else WORDSYNC_NEGATIVE_TTL}
         _save_wordsync_store()
     log_debug("[WordSync] Sem timing por palavra confiável para esta música.")
     return None
