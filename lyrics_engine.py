@@ -397,7 +397,19 @@ def fetch_wordsync_lyrics_sync(track_name, artist_name, duration, reference_line
         with urllib.request.urlopen(req, timeout=25) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        if e.code in (429, 403):
+        body = ""
+        try:
+            body = e.read().decode("utf-8", "ignore")[:3000]
+        except Exception:
+            pass
+        if e.code in (429, 403) and "1027" in body:
+            # Cloudflare Workers (plano gratuito do dono): 100 mil pedidos/dia somando todos os usuários; zera 00:00 UTC
+            resume = (int(time.time() // 86400) + 1) * 86400 + 120
+            with _wordsync_lock:
+                _wordsync_store["blocked_until"] = resume
+                _save_wordsync_store()
+            log_debug(f"[WordSync] LiriQo atingiu o limite diário do plano gratuito (erro 1027). Volta às {time.strftime('%H:%M', time.localtime(resume))}; letras por linha até lá.")
+        elif e.code in (429, 403):
             with _wordsync_lock:
                 strikes = _wordsync_store.get("strikes", 0) + 1
                 _wordsync_store["strikes"] = strikes
