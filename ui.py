@@ -36,7 +36,7 @@ class UISignals(QObject):
 GLOBAL_SIGNALS = UISignals()
 
 # Cor do preenchimento por tipo de sincronização (word = timing real por palavra): bem suave sobre o branco
-FILL_COLORS = {"word": (205, 255, 228), "verse": (255, 255, 255), "estimate": (255, 255, 255)}
+FILL_COLORS = {"word": (255, 240, 180), "verse": (255, 255, 255), "estimate": (255, 255, 255)}
 BG_COLOR = (140, 200, 255)   # cor do trecho entre parênteses (backing vocals / outro cantor)
 
 
@@ -526,6 +526,40 @@ class TaskbarLyricsWidget(QWidget):
         self.topmost_timer = QTimer(self)
         self.topmost_timer.timeout.connect(self.check_status)
         self.topmost_timer.start(150)
+
+        # Some quando o cursor (visível) passa por cima; volta quando ele sai
+        self.hover_opacity = 1.0
+        self.hover_timer = QTimer(self)
+        self.hover_timer.timeout.connect(self.check_mouse_hover)
+        self.hover_timer.start(30)
+
+    def check_mouse_hover(self):
+        if not is_window_truly_visible(self):
+            return
+        try:
+            flags, _, (x, y) = win32gui.GetCursorInfo()
+            left, top, right, bottom = win32gui.GetWindowRect(int(self.winId()))
+        except Exception:
+            return
+
+        # Cursor escondido (comum em jogos) não conta, mesmo que a posição passe por cima
+        cursor_visible = bool(flags & 0x1)
+        margin = 10
+        over = cursor_visible and (left - margin) <= x <= (right + margin) and (top - margin) <= y <= (bottom + margin)
+
+        now = time.perf_counter()
+        dt = min(0.1, now - getattr(self, "hover_last_tick", now))
+        self.hover_last_tick = now
+
+        # Some e volta no mesmo tempo (0,1s), calculado pelo tempo real entre os ticks
+        target = 0.0 if over else 1.0
+        step = dt / 0.1
+        if self.hover_opacity != target:
+            if self.hover_opacity < target:
+                self.hover_opacity = min(target, self.hover_opacity + step)
+            else:
+                self.hover_opacity = max(target, self.hover_opacity - step)
+            self.setWindowOpacity(self.hover_opacity)
 
     def init_ui(self):
         self.setWindowFlags(

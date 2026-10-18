@@ -121,12 +121,15 @@
     return 0;
   }
 
+  let lastDurationReliable = false;
+
   function getPlaybackDuration(player, video) {
     // 1. YouTube Player API Oficial
     if (player && typeof player.getDuration === 'function') {
       try {
         const d = player.getDuration();
         if (typeof d === 'number' && !isNaN(d) && isFinite(d) && d > 10 && d < 3600) {
+          lastDurationReliable = true;
           return d;
         }
       } catch (e) {}
@@ -146,7 +149,7 @@
           if (!segs.some(isNaN)) {
             const dur = (segs.length === 3) ? (segs[0] * 3600 + segs[1] * 60 + segs[2]) :
                         (segs.length === 2) ? (segs[0] * 60 + segs[1]) : (segs[0] || 0);
-            if (dur > 10 && dur < 3600) return dur;
+            if (dur > 10 && dur < 3600) { lastDurationReliable = true; return dur; }
           }
         }
       }
@@ -158,11 +161,12 @@
                      document.querySelector('#progress-bar');
       if (slider) {
         const maxVal = parseFloat(slider.getAttribute('aria-valuemax') || slider.max || 0);
-        if (!isNaN(maxVal) && maxVal > 10 && maxVal < 3600) return maxVal;
+        if (!isNaN(maxVal) && maxVal > 10 && maxVal < 3600) { lastDurationReliable = true; return maxVal; }
       }
     } catch (e) {}
 
-    // 4. Elemento de vídeo
+    // 4. Elemento de vídeo (pode vir parcial enquanto o áudio carrega: não é confiável)
+    lastDurationReliable = false;
     if (video && !isNaN(video.duration) && isFinite(video.duration) && video.duration > 10 && video.duration < 3600) {
       return video.duration;
     }
@@ -332,6 +336,7 @@
       artworkUrl: artworkUrl,
       currentTime: currentTime,
       duration: duration,
+      durationReliable: lastDurationReliable,
       isPlaying: isPlaying
     };
   }

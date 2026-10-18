@@ -101,6 +101,7 @@ class PlayerStateManager:
         self.translate_enabled = False
         self.line2_is_translation = False
         self.median_verse_gap = 3.5
+        self.duration_reliable = True
         self.voice_detector = None
         self.sync_mode = "estimate"   # "word" | "verse" | "estimate"
         self._voice_idx = -1
@@ -131,7 +132,7 @@ class PlayerStateManager:
         self.title = title
         if artist:
             self.artist = artist
-        if duration > 0:
+        if duration > 0 and (is_different or duration >= self.duration):
             self.duration = duration
         if artwork_url:
             self.artwork_url = artwork_url
@@ -179,7 +180,8 @@ class PlayerStateManager:
 
     def sync_time(self, current_time, duration, is_playing):
         now = time.perf_counter()
-        if duration > 0:
+        # A duração real não encolhe: a extensão às vezes manda valores parciais do buffer (ex: 50s, 80s...)
+        if duration > 0 and duration >= self.duration:
             self.duration = duration
         self.is_playing = is_playing
         self.last_sync_audio_time = current_time
@@ -266,7 +268,7 @@ class PlayerStateManager:
             return (self.title, self.artist, 1.0, True)
 
         # 2. Final da música ultrapassado -> Modo Card Limpo
-        if self.duration > 0 and current_time >= (self.duration - 0.4):
+        if self.duration > 0 and self.duration_reliable and current_time >= (self.duration - 0.4):
             return (self.title, self.artist, 1.0, True)
 
         first_lyric_time = self.lyrics[0]["time"]

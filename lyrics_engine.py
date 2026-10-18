@@ -28,8 +28,8 @@ def clean_title(title):
     if not title:
         return ""
     title = re.sub(r"^\(\d+\)\s*", "", title)
-    title = re.sub(r"\(.*?(official|video|audio|lyric|remastered|feat|ft\.|live|acoustic|deluxe|sped up|speed up|slowed|nightcore).*?\)", "", title, flags=re.IGNORECASE)
-    title = re.sub(r"\[.*?(official|video|audio|lyric|remastered|feat|ft\.|live|acoustic|deluxe|sped up|speed up|slowed|nightcore).*?\]", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\(.*?(official|video|audio|lyric|remastered|feat|ft\.|live|acoustic|deluxe|sped up|speed up|slowed|nightcore|radio edit|single version|album version|explicit).*?\)", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\[.*?(official|video|audio|lyric|remastered|feat|ft\.|live|acoustic|deluxe|sped up|speed up|slowed|nightcore|radio edit|single version|album version|explicit).*?\]", "", title, flags=re.IGNORECASE)
     title = re.sub(r"\s*[-|•]\s*YouTube.*$", "", title, flags=re.IGNORECASE)
 
     if " - " in title:
@@ -281,7 +281,45 @@ def overruns_duration(parsed_lines, duration, tempo_modified=False):
 # ---------------------------------------------------------
 LIRIQO_URL = "https://api.liriqo-alfarrizi.my.id/v1/lyrics?"
 WORDSYNC_PROVIDERS = ("golyrics_apple_music", "qq_portato", "kugou_legato", "amlyrics_apple_music", "binimum_apple_music")
-_wordsync_cache = {}
+WORDSYNC_CACHE_FILE = os.path.join(BASE_DIR, "wordsync_cache.json")
+WORDSYNC_POSITIVE_TTL = 90 * 86400   # letra com timing real guardada por 90 dias
+WORDSYNC_NEGATIVE_TTL = 24 * 3600    # "sem timing para esta música" guardado por 1 dia
+WORDSYNC_COOLDOWNS = (600, 1800, 3600, 7200)   # pausa progressiva depois de cada 429 seguido
+_wordsync_lock = threading.Lock()
+_wordsync_last_block_log = 0.0
+
+def _load_wordsync_store():
+    try:
+        with open(WORDSYNC_CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            data.setdefault("entries", {})
+            return data
+    except Exception:
+        pass
+    return {"entries": {}, "blocked_until": 0.0, "strikes": 0}
+
+def _save_wordsync_store():
+    try:
+        entries = _wordsync_store["entries"]
+        if len(entries) > 300:
+            for k in sorted(entries, key=lambda k: entries[k]["t"])[:len(entries) - 300]:
+                del entries[k]
+        with open(WORDSYNC_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(_wordsync_store, f, ensure_ascii=False)
+    except Exception as e:
+        log_debug(f"[WordSync] Não foi possível salvar o cache: {e}")
+
+def _decode_wordsync_lines(lines):
+    out = []
+    for l in lines:
+        l = dict(l)
+        if "words" in l:
+            l["words"] = [tuple(p) for p in l["words"]]
+        out.append(l)
+    return out
+
+_wordsync_store = _load_wordsync_store()
 
 def artist_names(name):
     """Separa 'A e B', 'A, B', 'A & B', 'A feat. B' em nomes normalizados (colaborações)."""
@@ -337,9 +375,19 @@ def fetch_wordsync_lyrics_sync(track_name, artist_name, duration, reference_line
         return None
     clean_artist = wanted[0]
 
-    cache_key = f"{query}___{clean_artist}___{int(duration) if duration > 0 else 0}"
-    if cache_key in _wordsync_cache:
-        return _wordsync_cache[cache_key]
+    global _wordsync_last_block_log
+    cache_key = f"{query}___{clean_artist}___{int(duration) // 4 if duration > 0 else 0}"
+    now = time.time()
+    with _wordsync_lock:
+        entry = _wordsync_store["entries"].get(cache_key)
+        if entry and now - entry["t"] < (WORDSYNC_POSITIVE_TTL if entry["lines"] else WORDSYNC_NEGATIVE_TTL):
+            return _decode_wordsync_lines(entry["lines"]) if entry["lines"] else None
+        blocked_until = _wordsync_store.get("blocked_until", 0.0)
+    if now < blocked_until:
+        if now - _wordsync_last_block_log > 60:
+            _wordsync_last_block_log = now
+            log_debug(f"[WordSync] LiriQo em pausa por limite de requisições; volta às {time.strftime('%H:%M', time.localtime(blocked_until))}.")
+        return None
 
     try:
         params = {"title": query, "artist": clean_artist}
@@ -348,9 +396,27 @@ def fetch_wordsync_lyrics_sync(track_name, artist_name, duration, reference_line
         req = urllib.request.Request(LIRIQO_URL + urllib.parse.urlencode(params), headers={"User-Agent": "TaskbarLyrics/3.0 (Windows 11)"})
         with urllib.request.urlopen(req, timeout=25) as resp:
             data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code in (429, 403):
+            with _wordsync_lock:
+                strikes = _wordsync_store.get("strikes", 0) + 1
+                _wordsync_store["strikes"] = strikes
+                cooldown = WORDSYNC_COOLDOWNS[min(strikes - 1, len(WORDSYNC_COOLDOWNS) - 1)]
+                _wordsync_store["blocked_until"] = time.time() + cooldown
+                _save_wordsync_store()
+            log_debug(f"[WordSync] LiriQo limitou as requisições (HTTP {e.code}). Pausando por {cooldown // 60} min; letras por linha enquanto isso.")
+        else:
+            log_debug(f"[WordSync] LiriQo indisponível (HTTP {e.code}), mantendo letras por linha.")
+        return None
     except Exception as e:
         log_debug(f"[WordSync] LiriQo indisponível, mantendo letras por linha: {e}")
         return None
+
+    with _wordsync_lock:
+        if _wordsync_store.get("strikes", 0):
+            _wordsync_store["strikes"] = 0
+            _wordsync_store["blocked_until"] = 0.0
+            _save_wordsync_store()
 
     tracks = {t.get("provider"): t for t in data.get("tracks", [])}
     # 1ª passada: só provedores com tempo por palavra; 2ª: aceita só início/fim reais do verso
@@ -384,9 +450,14 @@ def fetch_wordsync_lyrics_sync(track_name, artist_name, duration, reference_line
                 log_debug(f"[WordSync] {provider} descartado: início em {new_first:.1f}s vs {ref_first:.1f}s do LRCLIB")
                 continue
         log_debug(f"[WordSync] {provider}: {len(parsed)} versos com timing real por palavra.")
-        _wordsync_cache[cache_key] = parsed
+        with _wordsync_lock:
+            _wordsync_store["entries"][cache_key] = {"t": time.time(), "lines": parsed}
+            _save_wordsync_store()
         return parsed
 
+    with _wordsync_lock:
+        _wordsync_store["entries"][cache_key] = {"t": time.time(), "lines": None}
+        _save_wordsync_store()
     log_debug("[WordSync] Sem timing por palavra confiável para esta música.")
     return None
 
@@ -429,7 +500,7 @@ def fetch_synced_lyrics_sync(track_name, artist_name="", duration=0):
 
             url = "https://lrclib.net/api/get?" + urllib.parse.urlencode(params)
             req = urllib.request.Request(url, headers={"User-Agent": "TaskbarLyrics/3.0 (Windows 11)"})
-            with urllib.request.urlopen(req, timeout=2.5) as response:
+            with urllib.request.urlopen(req, timeout=6) as response:
                 if response.status == 200:
                     data = json.loads(response.read().decode("utf-8"))
                     synced = data.get("syncedLyrics")
@@ -442,8 +513,11 @@ def fetch_synced_lyrics_sync(track_name, artist_name="", duration=0):
                             parsed = check_and_rescale_lyrics(parsed, duration, item_dur, cand_track, raw_query, cand_album)
                             log_debug(f"[LRCLIB GET] Encontrados {len(parsed)} versos sincronizados.")
                             return parsed
-        except Exception:
-            pass
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                log_debug(f"[LRCLIB GET] Erro HTTP {e.code}.")
+        except Exception as e:
+            log_debug(f"[LRCLIB GET] Falhou: {e}")
 
         # Fallback GET sem duração
         if clean_artist:
@@ -451,7 +525,7 @@ def fetch_synced_lyrics_sync(track_name, artist_name="", duration=0):
                 params_nodur = {"track_name": query, "artist_name": clean_artist}
                 url = "https://lrclib.net/api/get?" + urllib.parse.urlencode(params_nodur)
                 req = urllib.request.Request(url, headers={"User-Agent": "TaskbarLyrics/3.0 (Windows 11)"})
-                with urllib.request.urlopen(req, timeout=2.5) as response:
+                with urllib.request.urlopen(req, timeout=6) as response:
                     if response.status == 200:
                         data = json.loads(response.read().decode("utf-8"))
                         synced = data.get("syncedLyrics")
@@ -473,7 +547,7 @@ def fetch_synced_lyrics_sync(track_name, artist_name="", duration=0):
             search_q = f"{query} {clean_artist}".strip()
             search_url = "https://lrclib.net/api/search?" + urllib.parse.urlencode({"q": search_q})
             search_req = urllib.request.Request(search_url, headers={"User-Agent": "TaskbarLyrics/3.0 (Windows 11)"})
-            with urllib.request.urlopen(search_req, timeout=3.0) as search_res:
+            with urllib.request.urlopen(search_req, timeout=7) as search_res:
                 if search_res.status == 200:
                     results = json.loads(search_res.read().decode("utf-8"))
                     norm_art = normalize_text(clean_artist).lower() if clean_artist else ""

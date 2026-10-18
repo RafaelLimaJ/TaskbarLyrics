@@ -22,3 +22,4 @@ env/
 
 # Cache de traducoes (gerado em runtime)
 translation_cache.json
+wordsync_cache.json

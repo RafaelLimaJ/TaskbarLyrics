@@ -53,14 +53,24 @@ class WebSocketServerController:
         except Exception as e:
             log_debug(f"[Server] Erro ao traduzir letras: {e}")
 
+    async def wait_reliable_duration(self, target_title, max_wait=6.0):
+        """A extensão às vezes manda a duração parcial do buffer no começo da faixa; espera a confiável."""
+        waited = 0.0
+        while not self.state.duration_reliable and waited < max_wait and self.state.title == target_title:
+            await asyncio.sleep(0.5)
+            waited += 0.5
+
     async def wordsync_worker(self, target_title):
         try:
             # Aguarda um pouco: o LRCLIB (rápido) costuma entregar antes e serve de referência de versão
             await asyncio.sleep(1.5)
             if self.state.title != target_title:
                 return
+            await self.wait_reliable_duration(target_title)
+            if self.state.title != target_title:
+                return
             cur_artist = self.state.artist
-            cur_dur = self.state.duration
+            cur_dur = self.state.duration if self.state.duration_reliable else 0
             reference = list(self.state.lyrics)
             wordsync = await asyncio.to_thread(fetch_wordsync_lyrics_sync, target_title, cur_artist, cur_dur, reference)
 
@@ -94,8 +104,11 @@ class WebSocketServerController:
                 if self.state.lyrics:
                     return
 
+                await self.wait_reliable_duration(target_title)
+                if self.state.title != target_title:
+                    return
                 cur_artist = self.state.artist
-                cur_dur = self.state.duration
+                cur_dur = self.state.duration if self.state.duration_reliable else 0
 
                 log_debug(f"[Server] Buscando letras para '{target_title}' (Artista: '{cur_artist}', Dur: {cur_dur}s)")
                 lyrics = await asyncio.to_thread(fetch_synced_lyrics_sync, target_title, cur_artist, cur_dur)
@@ -141,10 +154,12 @@ class WebSocketServerController:
                 artwork_url = data.get("artworkUrl", "")
                 current_time = float(data.get("currentTime", 0.0))
                 duration = float(data.get("duration", 0.0))
+                duration_reliable = bool(data.get("durationReliable", True))
                 is_playing = bool(data.get("isPlaying", True))
 
                 # Detecta mudança real de música
                 is_different = self.state.update_track(title, artist, artwork_url, duration)
+                self.state.duration_reliable = duration_reliable
                 now_loop = asyncio.get_event_loop().time()
 
                 if is_different:
