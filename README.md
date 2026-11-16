@@ -22,6 +22,7 @@ A sleek, lightweight, and hardware-accelerated synced lyrics and karaoke overlay
 - **Windows Taskbar Native Integration**:
   - Transparent, frameless overlay using low-level Win32 hooks (WS_EX_LAYERED, WS_EX_TRANSPARENT, topmost persistence).
   - Auto-hides on pause/stop and appears instantly on playback.
+- **Native players (ytm-rs)**: also reads the Windows media panel (SMTC) for the players listed in `smtc_source.py` (`SMTC_APPS`), so desktop clients work without the browser extension.
 - **Zero-Latency Local WebSocket Bridge**: Direct communication between the browser extension and desktop widget at ws://127.0.0.1:5678.
 - **Multi-Source Synced Lyrics Engine**: Line-synced lyrics from LRCLIB, plus real word-by-word timing from several independent sources queried in parallel (Apple Music TTML via binimum/LyricsPlus, KuGou KRC, NetEase YRC, BetterLyrics, LiriQo as fallback), with per-source rate-limit handling and an on-disk cache.
 
@@ -42,7 +43,7 @@ cd TaskbarLyrics
 
 ### 3. Install Python Dependencies
 ```bash
-pip install PyQt6 pywin32 websockets requests numpy soundcard
+pip install PyQt6 pywin32 websockets requests numpy soundcard winrt-runtime winrt-Windows.Media.Control winrt-Windows.Foundation winrt-Windows.Foundation.Collections winrt-Windows.Storage.Streams
 ```
 
 ### 4. Install Browser Extension

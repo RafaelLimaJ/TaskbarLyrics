@@ -1,4 +1,5 @@
 import json
+import time
 import re
 import asyncio
 import threading
@@ -6,6 +7,7 @@ import websockets
 from config import WS_HOST, WS_PORT, log_debug
 from lyrics_engine import fetch_synced_lyrics_sync, fetch_wordsync_lyrics_sync, translate_lyrics_to_pt
 from ui import GLOBAL_SIGNALS
+from smtc_source import SmtcSource
 
 class WebSocketServerController:
     """Controlador do servidor WebSocket do TaskbarLyrics."""
@@ -17,6 +19,7 @@ class WebSocketServerController:
         self.current_wordsync_task = None
         self.current_translate_task = None
         self.translate_requested_for = None
+        self.last_playing_source = None
         self.last_track_change_time = 0.0
         self.last_audio_time = 0.0
         self.last_audio_advance_time = 0.0
@@ -126,6 +129,89 @@ class WebSocketServerController:
         except asyncio.CancelledError:
             pass
 
+    async def process_update(self, source, title, artist, artwork_url, current_time, duration, duration_reliable, is_playing, trust_time=False):
+        """Atualização de qualquer origem (extensão do navegador ou painel de mídia do Windows)."""
+        self.maybe_start_translation()
+
+        # Duas origens ao mesmo tempo: enquanto uma delas está tocando, a outra não interfere
+        now_wall = time.time()
+        if is_playing:
+            self.last_playing_source = (source, now_wall)
+        else:
+            lp = self.last_playing_source
+            if lp and lp[0] != source and now_wall - lp[1] < 3.0:
+                return
+
+        # Detecta mudança real de música
+        is_different = self.state.update_track(title, artist, artwork_url, duration)
+        self.state.duration_reliable = duration_reliable
+        now_loop = asyncio.get_event_loop().time()
+
+        if is_different:
+            self.last_track_change_time = now_loop
+            self.last_audio_time = 0.0
+            self.last_audio_advance_time = now_loop
+            self.consecutive_zero_drops = 0
+            if not trust_time:
+                current_time = 0.0
+
+            if artwork_url:
+                self.ui_widget.trigger_artwork_download(artwork_url)
+
+            # Dispara busca de letras para a nova música
+            if self.current_fetch_task and not self.current_fetch_task.done():
+                self.current_fetch_task.cancel()
+            self.current_fetch_task = asyncio.create_task(self.check_lyrics_worker(title))
+
+            # Em paralelo: timing real por palavra (lento, substitui as letras se chegar)
+            if self.current_wordsync_task and not self.current_wordsync_task.done():
+                self.current_wordsync_task.cancel()
+            self.current_wordsync_task = asyncio.create_task(self.wordsync_worker(title))
+        else:
+            if artwork_url:
+                self.ui_widget.trigger_artwork_download(artwork_url)
+
+        # Proteção robusta contra pacotes espúrios com tempo zerado no meio da faixa
+        if not trust_time and not is_different and self.last_audio_time > 5.0 and current_time < 1.0:
+            if not is_playing:
+                # O usuário pausou! Pausa instantânea no último tempo conhecido
+                self.state.sync_time(self.last_audio_time, duration, False)
+                return
+            else:
+                # Glitch de tempo zerado durante reprodução:
+                # Mantém a interpolação contínua fluindo suavemente e renova o heartbeat
+                effective_time = self.state.get_interpolated_time()
+                self.state.sync_time(effective_time, duration, True)
+                return
+
+        # Determinação robusta do estado de reprodução
+        if not is_playing:
+            # Se o navegador sinalizou explicitamente pausa:
+            final_is_playing = False
+            self.last_audio_time = current_time
+        else:
+            # O navegador sinalizou reprodução. Verificamos o avanço real do áudio:
+            if trust_time:
+                self.last_audio_time = current_time
+                final_is_playing = True
+            elif abs(current_time - self.last_audio_time) > 0.02:
+                self.last_audio_time = current_time
+                self.last_audio_advance_time = now_loop
+                final_is_playing = True
+            else:
+                # Tempo idêntico ao pacote anterior.
+                # Se estiver estático há mais de 0.8s, está de fato pausado (proteção contra heartbeat enganoso)
+                if self.last_audio_advance_time > 0 and (now_loop - self.last_audio_advance_time) > 0.8:
+                    final_is_playing = False
+                else:
+                    final_is_playing = self.state.is_playing
+
+        if final_is_playing != self.state.is_playing:
+            log_debug(f"[Server] Estado alterado: is_playing={final_is_playing} (browser_isPlaying={is_playing}, curr={current_time:.2f}s, last={self.last_audio_time:.2f}s)")
+
+        # Sincroniza o relógio no gerenciador de estado
+        self.state.sync_time(self.last_audio_time, duration, final_is_playing)
+
     async def ws_handler(self, websocket):
         log_debug("[Server] Extensão conectada via WebSocket!")
 
@@ -138,8 +224,6 @@ class WebSocketServerController:
                 if data.get("closed"):
                     GLOBAL_SIGNALS.stop_playback.emit()
                     continue
-
-                self.maybe_start_translation()
 
                 raw_title = data.get("title", "")
                 raw_artist = data.get("artist", "")
@@ -157,76 +241,41 @@ class WebSocketServerController:
                 duration_reliable = bool(data.get("durationReliable", True))
                 is_playing = bool(data.get("isPlaying", True))
 
-                # Detecta mudança real de música
-                is_different = self.state.update_track(title, artist, artwork_url, duration)
-                self.state.duration_reliable = duration_reliable
-                now_loop = asyncio.get_event_loop().time()
-
-                if is_different:
-                    self.last_track_change_time = now_loop
-                    self.last_audio_time = 0.0
-                    self.last_audio_advance_time = now_loop
-                    self.consecutive_zero_drops = 0
-                    current_time = 0.0
-
-                    if artwork_url:
-                        self.ui_widget.trigger_artwork_download(artwork_url)
-
-                    # Dispara busca de letras para a nova música
-                    if self.current_fetch_task and not self.current_fetch_task.done():
-                        self.current_fetch_task.cancel()
-                    self.current_fetch_task = asyncio.create_task(self.check_lyrics_worker(title))
-
-                    # Em paralelo: timing real por palavra (lento, substitui as letras se chegar)
-                    if self.current_wordsync_task and not self.current_wordsync_task.done():
-                        self.current_wordsync_task.cancel()
-                    self.current_wordsync_task = asyncio.create_task(self.wordsync_worker(title))
-                else:
-                    if artwork_url:
-                        self.ui_widget.trigger_artwork_download(artwork_url)
-
-                # Proteção robusta contra pacotes espúrios com tempo zerado no meio da faixa
-                if not is_different and self.last_audio_time > 5.0 and current_time < 1.0:
-                    if not is_playing:
-                        # O usuário pausou! Pausa instantânea no último tempo conhecido
-                        self.state.sync_time(self.last_audio_time, duration, False)
-                        continue
-                    else:
-                        # Glitch de tempo zerado durante reprodução:
-                        # Mantém a interpolação contínua fluindo suavemente e renova o heartbeat
-                        effective_time = self.state.get_interpolated_time()
-                        self.state.sync_time(effective_time, duration, True)
-                        continue
-
-                # Determinação robusta do estado de reprodução
-                if not is_playing:
-                    # Se o navegador sinalizou explicitamente pausa:
-                    final_is_playing = False
-                    self.last_audio_time = current_time
-                else:
-                    # O navegador sinalizou reprodução. Verificamos o avanço real do áudio:
-                    if abs(current_time - self.last_audio_time) > 0.02:
-                        self.last_audio_time = current_time
-                        self.last_audio_advance_time = now_loop
-                        final_is_playing = True
-                    else:
-                        # Tempo idêntico ao pacote anterior.
-                        # Se estiver estático há mais de 0.8s, está de fato pausado (proteção contra heartbeat enganoso)
-                        if self.last_audio_advance_time > 0 and (now_loop - self.last_audio_advance_time) > 0.8:
-                            final_is_playing = False
-                        else:
-                            final_is_playing = self.state.is_playing
-
-                if final_is_playing != self.state.is_playing:
-                    log_debug(f"[Server] Estado alterado: is_playing={final_is_playing} (browser_isPlaying={is_playing}, curr={current_time:.2f}s, last={self.last_audio_time:.2f}s)")
-
-                # Sincroniza o relógio no gerenciador de estado
-                self.state.sync_time(self.last_audio_time, duration, final_is_playing)
+                await self.process_update(
+                    "extension", title, artist, artwork_url, current_time, duration, duration_reliable, is_playing)
 
         except Exception as e:
             log_debug(f"[Server] Conexão WebSocket encerrada: {e}")
 
+    async def smtc_loop(self):
+        """Players nativos (ex: ytm-rs) pelo painel de mídia do Windows."""
+        source = SmtcSource()
+        await source.start()
+        if not source.available:
+            return
+        art_for = None
+        last_error_log = 0.0
+        while True:
+            try:
+                info = await source.read()
+                if info:
+                    await self.process_update(
+                        "smtc", info["title"], info["artist"], "", info["position"], info["duration"],
+                        True, info["playing"], trust_time=True)
+                    key = (info["title"], info["artist"])
+                    if key != art_for and info["thumbnail"] is not None:
+                        art_for = key
+                        data = await source.read_thumbnail(info["thumbnail"])
+                        if data:
+                            GLOBAL_SIGNALS.artwork_loaded.emit(data)
+            except Exception as e:
+                if time.time() - last_error_log > 30:
+                    last_error_log = time.time()
+                    log_debug(f"[SMTC] Erro ao ler o painel de mídia: {e}")
+            await asyncio.sleep(0.25)
+
     async def start(self):
+        asyncio.create_task(self.smtc_loop())
         async with websockets.serve(self.ws_handler, WS_HOST, WS_PORT):
             log_debug(f"[Server] Servidor WebSocket escutando em ws://{WS_HOST}:{WS_PORT}")
             await asyncio.Future()
