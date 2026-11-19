@@ -274,7 +274,7 @@ def fetch_lyricsplus(query, wanted, duration):
     params = {"title": query, "artist": wanted[0]}
     if 0 < duration <= 900:
         params["duration"] = int(duration)
-    j = json.loads(_http_get("https://lyricsplus.binimum.org/v2/lyrics/get?" + _qs(params), timeout=20))
+    j = json.loads(_http_get("https://lyricsplus.binimum.org/v2/lyrics/get?" + _qs(params), timeout=35))
     meta = j.get("metadata") or {}
     if meta.get("title") and core_title(meta["title"]) != core_title(query):
         return None
@@ -376,7 +376,7 @@ DIRECT_PROVIDERS = (
     ("netease_yrc", fetch_netease),
 )
 
-def collect_direct_tracks(query, wanted, duration, timeout=20):
+def collect_direct_tracks(query, wanted, duration, timeout=40):
     """Consulta todas as fontes diretas em paralelo. Retorna ({provider: track}, houve_erro)."""
     tracks = {}
     had_error = False

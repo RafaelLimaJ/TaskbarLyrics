@@ -426,7 +426,11 @@ def _fetch_liriqo_tracks(query, clean_artist, duration):
             _save_wordsync_store()
     return {t.get("provider"): t for t in data.get("tracks", [])}, False
 
-def fetch_wordsync_lyrics_sync(track_name, artist_name, duration, reference_lines=None):
+last_wordsync_had_error = False
+
+def fetch_wordsync_lyrics_sync(track_name, artist_name, duration, reference_lines=None, force_refresh=False):
+    global last_wordsync_had_error
+    last_wordsync_had_error = False
     if not artist_name or is_tempo_modified(track_name):
         return None
     query = re.sub(r"\s*[\(\[]\s*(?:with|part\.?|feat\.?|ft\.?)\b[^)\]]*[\)\]]", "", clean_title(track_name), flags=re.IGNORECASE).strip()
@@ -438,7 +442,7 @@ def fetch_wordsync_lyrics_sync(track_name, artist_name, duration, reference_line
     cache_key = f"{query}___{clean_artist}___{int(duration) // 4 if duration > 0 else 0}"
     now = time.time()
     with _wordsync_lock:
-        entry = _wordsync_store["entries"].get(cache_key)
+        entry = None if force_refresh else _wordsync_store["entries"].get(cache_key)
         if entry:
             ttl = entry.get("ttl") or (WORDSYNC_POSITIVE_TTL if entry["lines"] else WORDSYNC_NEGATIVE_TTL)
             if now - entry["t"] < ttl:
@@ -452,6 +456,7 @@ def fetch_wordsync_lyrics_sync(track_name, artist_name, duration, reference_line
         for name, t in (lq_tracks or {}).items():
             tracks.setdefault(name, t)
         had_error = had_error or lq_error
+    last_wordsync_had_error = had_error
 
     # 1ª passada: só provedores com tempo por palavra; 2ª: aceita só início/fim reais do verso
     attempts = [(p, True) for p in WORDSYNC_PROVIDERS] + [(p, False) for p in WORDSYNC_PROVIDERS]
@@ -488,7 +493,9 @@ def fetch_wordsync_lyrics_sync(track_name, artist_name, duration, reference_line
         with _wordsync_lock:
             entry = {"t": time.time(), "lines": parsed}
             if not need_words:
-                entry["ttl"] = 3 * 86400   # só fim de verso: tenta de novo em 3 dias (pode surgir timing por palavra)
+                # só fim de verso: tenta de novo em 3 dias (pode surgir timing por palavra);
+                # se alguma fonte falhou (timeout/limite), tenta de novo em 10 minutos
+                entry["ttl"] = 600 if had_error else 3 * 86400
             _wordsync_store["entries"][cache_key] = entry
             _save_wordsync_store()
         return parsed

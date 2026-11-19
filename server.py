@@ -5,6 +5,7 @@ import asyncio
 import threading
 import websockets
 from config import WS_HOST, WS_PORT, log_debug
+import lyrics_engine
 from lyrics_engine import fetch_synced_lyrics_sync, fetch_wordsync_lyrics_sync, translate_lyrics_to_pt
 from ui import GLOBAL_SIGNALS
 from smtc_source import SmtcSource
@@ -63,6 +64,17 @@ class WebSocketServerController:
             await asyncio.sleep(0.5)
             waited += 0.5
 
+    def apply_wordsync(self, target_title, wordsync, reference):
+        # Se o LRCLIB chegou depois da referência vazia, revalida contra ele
+        if self.state.lyrics and not reference:
+            first_old = next((l["time"] for l in self.state.lyrics if l["text"] != "♪"), None)
+            first_new = next((l["time"] for l in wordsync if l["text"] != "♪"), None)
+            if first_old is not None and first_new is not None and abs(first_old - first_new) > 4.0:
+                return
+        self.state.set_lyrics(wordsync)
+        self.state.set_translations({})
+        log_debug(f"[Server] Letras com timing real aplicadas para '{target_title}' ({len(wordsync)} versos, modo {self.state.sync_mode})")
+
     async def wordsync_worker(self, target_title):
         try:
             # Aguarda um pouco: o LRCLIB (rápido) costuma entregar antes e serve de referência de versão
@@ -75,7 +87,23 @@ class WebSocketServerController:
             cur_artist = self.state.artist
             cur_dur = self.state.duration if self.state.duration_reliable else 0
             reference = list(self.state.lyrics)
-            wordsync = await asyncio.to_thread(fetch_wordsync_lyrics_sync, target_title, cur_artist, cur_dur, reference)
+            wordsync = None
+            # Se alguma fonte falhou (timeout/limite) e só veio fim de verso, tenta de novo enquanto a música toca
+            for attempt in range(3):
+                wordsync = await asyncio.to_thread(
+                    fetch_wordsync_lyrics_sync, target_title, cur_artist, cur_dur, reference, attempt > 0)
+                if self.state.title != target_title:
+                    return
+                had_error = lyrics_engine.last_wordsync_had_error
+                real_words = bool(wordsync) and sum(1 for l in wordsync if len(l.get("words", [])) > 2) >= len(wordsync) * 0.6
+                if real_words or not had_error or attempt == 2:
+                    break
+                if wordsync:
+                    self.apply_wordsync(target_title, wordsync, reference)   # mostra o que já temos enquanto espera
+                    reference = list(self.state.lyrics)
+                await asyncio.sleep(70)
+                if self.state.title != target_title:
+                    return
 
             if not wordsync or self.state.title != target_title:
                 return
@@ -86,9 +114,7 @@ class WebSocketServerController:
                 if first_old is not None and first_new is not None and abs(first_old - first_new) > 4.0:
                     return
 
-            self.state.set_lyrics(wordsync)
-            self.state.set_translations({})
-            log_debug(f"[Server] Letras com timing real por palavra aplicadas para '{target_title}' ({len(wordsync)} versos)")
+            self.apply_wordsync(target_title, wordsync, reference)
 
         except asyncio.CancelledError:
             pass
