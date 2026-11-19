@@ -113,6 +113,7 @@ class VoiceDetector(VoiceAnalyzer):
     def __init__(self):
         super().__init__()
         self.available = False
+        self.enabled = False      # a captura só roda quando precisa (música sem timing real, tocando)
         self._thread = None
 
     def start(self):
@@ -128,23 +129,33 @@ class VoiceDetector(VoiceAnalyzer):
     def is_ready(self):
         return self.available and self.ready(time.perf_counter())
 
+    def reset(self):
+        """Limpa o histórico (a captura foi pausada e o áudio mudou)."""
+        VoiceAnalyzer.__init__(self)
+
     def _run(self):
         import soundcard as sc
         warnings.filterwarnings("ignore", category=sc.SoundcardRuntimeWarning)
         while True:
+            if not self.enabled:
+                time.sleep(0.4)
+                continue
             try:
+                self.reset()
                 speaker = sc.default_speaker()
                 mic = sc.get_microphone(speaker.name, include_loopback=True)
                 log_debug(f"[Voz] Capturando áudio de: {speaker.name}")
                 with mic.recorder(samplerate=SR, channels=2, blocksize=HOP) as rec:
                     blocks = 0
-                    while True:
+                    while self.enabled:
                         data = rec.record(numframes=HOP)
                         self.process(np.asarray(data, np.float32), time.perf_counter())
                         blocks += 1
                         if blocks % 250 == 0 and sc.default_speaker().name != speaker.name:
                             log_debug("[Voz] Dispositivo de saída mudou; reconectando.")
                             break
+                if not self.enabled:
+                    log_debug("[Voz] Captura pausada (não necessária para esta música).")
             except Exception as e:
                 log_debug(f"[Voz] Captura interrompida ({e}); tentando de novo em 3s.")
                 time.sleep(3)

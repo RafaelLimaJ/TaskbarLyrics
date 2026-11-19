@@ -72,7 +72,7 @@ def load_saved_position():
             log_debug(f"Erro ao carregar position.json: {e}")
     return 1, 1035
 
-def save_position(x, y):
+def save_position(x, y, custom=True):
     try:
         data = {}
         if os.path.exists(CONFIG_FILE):
@@ -80,6 +80,7 @@ def save_position(x, y):
                 data = json.load(f)
         data["x"] = int(x)
         data["y"] = int(y)
+        data["custom"] = bool(custom)
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f)
     except Exception as e:
@@ -106,3 +107,11 @@ def save_translate_setting(enabled):
             json.dump(data, f)
     except Exception as e:
         log_debug(f"Erro ao salvar translate_to_pt: {e}")
+
+
+def load_position_is_custom():
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return bool(json.load(f).get("custom", False))
+    except Exception:
+        return False

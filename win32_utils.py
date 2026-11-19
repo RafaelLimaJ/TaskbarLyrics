@@ -6,15 +6,17 @@ from config import log_debug
 
 user32 = ctypes.windll.user32
 
-def apply_overlay_window_styles(hwnd):
-    """Aplica atributos Win32 para garantir transparência a cliques e permanência no topo sem roubar foco."""
+def apply_overlay_window_styles(hwnd, click_through=True):
+    """Aplica atributos Win32 para garantir transparência a cliques e permanência no topo sem roubar foco.
+    Com click_through=False a janela recebe o mouse (modo de mover)."""
     try:
         ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
-        win32gui.SetWindowLong(
-            hwnd,
-            win32con.GWL_EXSTYLE,
-            ex_style | win32con.WS_EX_TRANSPARENT | win32con.WS_EX_NOACTIVATE | win32con.WS_EX_TOPMOST
-        )
+        ex_style |= win32con.WS_EX_NOACTIVATE | win32con.WS_EX_TOPMOST
+        if click_through:
+            ex_style |= win32con.WS_EX_TRANSPARENT
+        else:
+            ex_style &= ~win32con.WS_EX_TRANSPARENT
+        win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, ex_style)
         win32gui.SetWindowPos(
             hwnd,
             win32con.HWND_TOPMOST,
@@ -24,10 +26,10 @@ def apply_overlay_window_styles(hwnd):
     except Exception as e:
         log_debug(f"Erro ao aplicar estilos Win32 overlay: {e}")
 
-def show_overlay_window(hwnd):
+def show_overlay_window(hwnd, click_through=True):
     """Garante que a janela nativa seja exibida sem foco e permaneça topmost no DWM."""
     try:
-        apply_overlay_window_styles(hwnd)
+        apply_overlay_window_styles(hwnd, click_through)
         win32gui.ShowWindow(hwnd, win32con.SW_SHOWNOACTIVATE)
         win32gui.SetWindowPos(
             hwnd,
@@ -76,3 +78,14 @@ def setup_topmost_event_hook(trigger_callback):
 
     _hook_proc_ref = WinEventProcType(event_callback)
     user32.SetWinEventHook(3, 9, 0, _hook_proc_ref, 0, 0, 0)
+
+
+def get_taskbar_rect():
+    """(esq, topo, dir, base) da barra de tarefas principal, ou None."""
+    try:
+        hwnd = win32gui.FindWindow("Shell_TrayWnd", None)
+        if hwnd:
+            return win32gui.GetWindowRect(hwnd)
+    except Exception:
+        pass
+    return None

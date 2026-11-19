@@ -7,12 +7,12 @@ from PyQt6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QLabel, QSystemTrayIcon,
     QMenu, QApplication, QPushButton, QPlainTextEdit, QDialog
 )
-from PyQt6.QtGui import QPainter, QPainterPath, QColor, QFont, QFontMetrics, QPixmap, QIcon, QAction, QTransform
-from PyQt6.QtCore import Qt, QTimer, QRectF, pyqtSignal, QObject
+from PyQt6.QtGui import QPen, QPainter, QPainterPath, QColor, QFont, QFontMetrics, QPixmap, QIcon, QAction, QTransform
+from PyQt6.QtCore import pyqtProperty, QPropertyAnimation, QEasingCurve, QRect, QPoint, Qt, QTimer, QRectF, pyqtSignal, QObject
 import win32gui
 import win32con
-from config import CARD_WIDTH, CARD_HEIGHT, load_saved_position, log_debug, LOG_FILE, load_translate_setting, save_translate_setting
-from win32_utils import apply_overlay_window_styles, show_overlay_window, hide_overlay_window
+from config import CARD_WIDTH, CARD_HEIGHT, load_saved_position, log_debug, LOG_FILE, load_translate_setting, save_translate_setting, save_position, load_position_is_custom
+from win32_utils import apply_overlay_window_styles, show_overlay_window, hide_overlay_window, get_taskbar_rect
 
 def is_window_truly_visible(widget):
     """Verifica se a janela está visível tanto no estado do Qt quanto no pipeline nativo do Win32."""
@@ -28,12 +28,42 @@ def is_window_truly_visible(widget):
         pass
     return False
 
+def rounded_path(rect, tl, tr, br, bl):
+    """Retângulo com raio independente em cada canto (0 = canto reto, para encostar na borda da tela)."""
+    x, y, w, h = rect.x(), rect.y(), rect.width(), rect.height()
+    p = QPainterPath()
+    p.moveTo(x + tl, y)
+    p.lineTo(x + w - tr, y)
+    if tr:
+        p.arcTo(x + w - 2 * tr, y, 2 * tr, 2 * tr, 90, -90)
+    p.lineTo(x + w, y + h - br)
+    if br:
+        p.arcTo(x + w - 2 * br, y + h - 2 * br, 2 * br, 2 * br, 0, -90)
+    p.lineTo(x + bl, y + h)
+    if bl:
+        p.arcTo(x, y + h - 2 * bl, 2 * bl, 2 * bl, -90, -90)
+    p.lineTo(x, y + tl)
+    if tl:
+        p.arcTo(x, y, 2 * tl, 2 * tl, 180, -90)
+    p.closeSubpath()
+    return p
+
+
 class UISignals(QObject):
     artwork_loaded = pyqtSignal(bytes)
     force_topmost = pyqtSignal()
     stop_playback = pyqtSignal()
 
 GLOBAL_SIGNALS = UISignals()
+
+# Estilo do cartão
+FONT_MAIN_FAMILY = "Google Sans"   # linha principal
+FONT_NEXT_FAMILY = "Google Sans"               # segunda linha
+CARD_RADIUS = 12
+CARD_DEFAULT_COLOR = (34, 28, 26)
+ART_SIZE = 36
+ISLAND_ART = 32
+ISLAND_MARGIN = 16
 
 # Cor do preenchimento por tipo de sincronização (word = timing real por palavra): bem suave sobre o branco
 FILL_COLORS = {"word": (255, 240, 180), "verse": (255, 255, 255), "estimate": (255, 255, 255)}
@@ -94,11 +124,11 @@ class KaraokeLineWidget(QWidget):
         self.transition_start_time = 0.0
         self.transition_duration = 0.24  # 240ms cubic ease
 
-        self.font_main = QFont("SF Pro Display", 11, QFont.Weight.Bold)
+        self.font_main = QFont(FONT_MAIN_FAMILY, 11, QFont.Weight.Bold)
         self.font_main.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
         self.font_symbol = QFont("Microsoft YaHei UI", 13, QFont.Weight.Bold)
         self.font_symbol.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
-        self.font_next = QFont("SF Pro Display", 9, QFont.Weight.DemiBold)
+        self.font_next = QFont(FONT_NEXT_FAMILY, 9, QFont.Weight.DemiBold)
         self.font_next.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
 
     def set_state(self, current_text, next_text, progress, is_card_mode, is_translate_mode=False):
@@ -175,6 +205,11 @@ class KaraokeLineWidget(QWidget):
 
     def paintEvent(self, event):
         if not self.current_text and not self.next_text:
+            if getattr(self, 'move_hint', False):
+                p = QPainter(self)
+                p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+                self._draw_text_with_shadow(p, 0, 22, "Arraste para mover", self.font_main, QColor(255, 255, 255, 200), 160)
+                p.end()
             return
 
         painter = QPainter(self)
@@ -534,6 +569,8 @@ class TaskbarLyricsWidget(QWidget):
         self.hover_timer.start(30)
 
     def check_mouse_hover(self):
+        if getattr(self, 'move_mode', False):
+            return
         if not is_window_truly_visible(self):
             return
         try:
@@ -573,12 +610,12 @@ class TaskbarLyricsWidget(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
 
         layout = QHBoxLayout()
-        layout.setContentsMargins(6, 4, 10, 4)
-        layout.setSpacing(10)
+        layout.setContentsMargins(6, 4, 12, 4)
+        layout.setSpacing(12)
 
         self.lbl_art = QLabel()
-        self.lbl_art.setFixedSize(36, 36)
-        self.lbl_art.setStyleSheet("background: rgba(255,255,255,0.06); border-radius: 6px;")
+        self.lbl_art.setFixedSize(ART_SIZE, ART_SIZE)
+        self.lbl_art.setStyleSheet("background: rgba(255,255,255,0.06); border-radius: 7px;")
         self.lbl_art.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.set_default_art()
 
@@ -588,14 +625,18 @@ class TaskbarLyricsWidget(QWidget):
         layout.addWidget(self.karaoke_widget, 1)
         self.setLayout(layout)
 
-        self.resize(CARD_WIDTH, CARD_HEIGHT)
+        self.island = True
+        self._morph = 1.0
+        self._island_w = self.island_width()
+        self._set_morph(1.0)
+        self.resize(self._island_w, CARD_HEIGHT)
         self.hide_window()
 
     def show_window(self):
         self.show()
         try:
             hwnd = int(self.winId())
-            show_overlay_window(hwnd)
+            show_overlay_window(hwnd, click_through=not getattr(self, 'move_mode', False))
         except Exception:
             pass
 
@@ -645,6 +686,11 @@ class TaskbarLyricsWidget(QWidget):
         self.translate_action.setChecked(init_trans)
         self.translate_action.triggered.connect(self.on_toggle_translate)
         menu.addAction(self.translate_action)
+
+        self.move_action = QAction("✥ Mover letras (arrastar com o mouse)", self)
+        self.move_action.setCheckable(True)
+        self.move_action.triggered.connect(self.on_toggle_move)
+        menu.addAction(self.move_action)
         menu.addSeparator()
 
         logs_action = QAction("📜 Ver Logs em Tempo Real", self)
@@ -663,6 +709,96 @@ class TaskbarLyricsWidget(QWidget):
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(self.on_tray_activated)
         self.tray.show()
+
+    def _get_morph(self):
+        return getattr(self, '_morph', 0.0)
+
+    def _set_morph(self, m):
+        """Transformação cartão -> ilha: capa, margens e (na pintura) cantos/cores acompanham o valor m."""
+        self._morph = m
+        size = round(ART_SIZE + (ISLAND_ART - ART_SIZE) * m)
+        rad = 7 + (size / 2 - 7) * m
+        key = (size, round(rad, 1))
+        if getattr(self, '_art_cache_key', None) != key:
+            self._art_cache_key = key
+            self.lbl_art.setFixedSize(size, size)
+            src = getattr(self, '_art_src', None)
+            if src is not None:
+                self.lbl_art.setPixmap(self.get_rounded_pixmap(src, size, rad))
+        self.layout().setContentsMargins(round(6 + 2 * m), 4, round(12 + 6 * m), 4)
+        self.update()
+
+    morph = pyqtProperty(float, _get_morph, _set_morph)
+
+    def apply_art_style(self):
+        self._art_cache_key = None
+        self._set_morph(self._get_morph())
+
+    def island_width(self):
+        """Largura da cápsula = capa + a maior das duas linhas (limitada), como a Dynamic Island que se ajusta ao conteúdo."""
+        k = self.karaoke_widget
+        t1 = parse_runs(k.current_text)[0]
+        t2 = k.next_text.replace("(", "").replace(")", "")
+        w1 = QFontMetrics(k.font_main).horizontalAdvance(t1)
+        w2 = QFontMetrics(k.font_next).horizontalAdvance(t2)
+        text_w = max(w1, w2, 120)
+        return int(max(260, min(ISLAND_ART + 12 + text_w + 8 + 18 + 8, 600)))
+
+    def animate_island(self, rect, duration=420, overshoot=True):
+        anim = QPropertyAnimation(self, b"geometry", self)
+        anim.setDuration(duration)
+        anim.setEasingCurve(QEasingCurve.Type.OutBack if overshoot else QEasingCurve.Type.OutCubic)
+        anim.setStartValue(self.geometry())
+        anim.setEndValue(rect)
+        old = getattr(self, "_move_anim", None)
+        if old is not None:
+            old.stop()
+        self._move_anim = anim
+        anim.start()
+
+    def island_rect(self, w):
+        r = self.compute_card_rect()
+        return QRect(r.x(), r.y(), w, r.height())
+
+    def fit_island_width(self):
+        """Expande/contrai a cápsula (com mola) quando a linha de letra muda de tamanho."""
+        if getattr(self, '_morphing', False):
+            return
+        w = self.island_width()
+        if abs(w - getattr(self, '_island_w', 0)) > 8:
+            self._island_w = w
+            self.animate_island(self.island_rect(w), 320)
+
+    def on_toggle_move(self, checked):
+        """Libera o cartão para arrastar; ao desligar, salva a posição e volta a deixar os cliques passarem."""
+        self.move_mode = bool(checked)
+        self._drag_offset = None
+        self.karaoke_widget.move_hint = self.move_mode
+        self.setWindowFlag(Qt.WindowType.WindowTransparentForInput, not self.move_mode)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, not self.move_mode)
+        if self.move_mode:
+            self.hover_opacity = 1.0
+            self.setWindowOpacity(1.0)
+            self.setCursor(Qt.CursorShape.SizeAllCursor)
+        else:
+            self.unsetCursor()
+            save_position(self.x(), self.y())
+            log_debug(f"[UI] Posição salva: x={self.x()} y={self.y()}")
+        self.show_window()
+        self.update()
+
+    def mousePressEvent(self, event):
+        if getattr(self, 'move_mode', False) and event.button() == Qt.MouseButton.LeftButton:
+            self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+
+    def mouseMoveEvent(self, event):
+        if getattr(self, '_drag_offset', None) is not None and (event.buttons() & Qt.MouseButton.LeftButton):
+            self.move(event.globalPosition().toPoint() - self._drag_offset)
+
+    def mouseReleaseEvent(self, event):
+        if getattr(self, '_drag_offset', None) is not None:
+            self._drag_offset = None
+            save_position(self.x(), self.y())
 
     def on_toggle_translate(self, checked):
         save_translate_setting(checked)
@@ -686,43 +822,83 @@ class TaskbarLyricsWidget(QWidget):
         except Exception as e:
             log_debug(f"Erro ao abrir arquivo de log: {e}")
 
-    def apply_saved_position(self):
+    def compute_card_rect(self):
+        """Retângulo do cartão encaixado na barra de tarefas (altura e posição vertical); x vem do arquivo."""
         x, y = load_saved_position()
-        self.move(x, y)
+        h = CARD_HEIGHT
+        tb = get_taskbar_rect()
+        if tb and not load_position_is_custom():
+            left, top, right, bottom = tb
+            tb_h = bottom - top
+            if 0 < tb_h < 200 and top > 100:          # barra embaixo
+                h = max(32, min(CARD_HEIGHT, tb_h - 4))
+                y = top + (tb_h - h) // 2
+        return QRect(x, y, getattr(self, '_island_w', CARD_WIDTH), h)
+
+    def apply_saved_position(self):
+        r = self.compute_card_rect()
+        self.setFixedHeight(r.height())
+        self.resize(r.width(), r.height())
+        self.move(r.x(), r.y())
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         rect = QRectF(0, 0, self.width(), self.height())
-        path = QPainterPath()
-        path.addRoundedRect(rect, 8, 8)
+        m = getattr(self, '_morph', 0.0)
+        if m > 0.001:
+            lerp = lambda a_, b_: a_ + (b_ - a_) * m
+            rr = lerp(CARD_RADIUS, rect.height() / 2)
+            r, g, b = getattr(self, "card_color", CARD_DEFAULT_COLOR)
+            fill = QColor(round(lerp(r, 8)), round(lerp(g, 8)), round(lerp(b, 10)), round(lerp(238, 246)))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(fill)
+            painter.drawPath(rounded_path(rect, rr, rr, rr, rr))
+            tint = QColor(r, g, b).lighter(230)
+            border = QColor(round(lerp(255, tint.red())), round(lerp(255, tint.green())), round(lerp(255, tint.blue())), round(lerp(26, 110)))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(border, lerp(1.0, 1.2)))
+            painter.drawPath(rounded_path(rect.adjusted(0.6, 0.6, -0.6, -0.6), rr, rr, rr, rr))
+            painter.end()
+            super().paintEvent(event)
+            return
+        fl = getattr(self, 'flush', None) or {}
+        rad = lambda *sides: 0 if any(fl.get(s) for s in sides) else CARD_RADIUS
+        path = rounded_path(rect, rad('t', 'l'), rad('t', 'r'), rad('b', 'r'), rad('b', 'l'))
 
+        r, g, b = getattr(self, "card_color", CARD_DEFAULT_COLOR)
         painter.save()
         painter.setClipPath(path)
-        painter.fillRect(self.rect(), QColor(12, 12, 12, 110))
+        painter.fillRect(self.rect(), QColor(r, g, b, 238))
+
         painter.restore()
 
-        painter.setPen(QColor(255, 255, 255, 28))
-        painter.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), 8, 8)
+        painter.setPen(QColor(255, 255, 255, 26))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        if getattr(self, 'move_mode', False):
+            pen = QPen(QColor(255, 255, 255, 190), 1.5, Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+        painter.drawPath(rounded_path(rect.adjusted(0.5, 0.5, -0.5, -0.5), rad('t', 'l'), rad('t', 'r'), rad('b', 'r'), rad('b', 'l')))
         painter.end()
 
         super().paintEvent(event)
 
     def set_default_art(self):
-        pix = QPixmap(36, 36)
+        pix = QPixmap(ART_SIZE, ART_SIZE)
         pix.fill(QColor(25, 28, 38))
         self.lbl_art.setPixmap(self.get_rounded_pixmap(pix))
 
-    def get_rounded_pixmap(self, src_pixmap):
-        scaled = src_pixmap.scaled(36, 36, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
-        rounded = QPixmap(36, 36)
+    def get_rounded_pixmap(self, src_pixmap, size=None, radius=7):
+        size = size or ART_SIZE
+        scaled = src_pixmap.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+        rounded = QPixmap(size, size)
         rounded.fill(Qt.GlobalColor.transparent)
 
         painter = QPainter(rounded)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         path = QPainterPath()
-        path.addRoundedRect(0, 0, 36, 36, 6, 6)
+        path.addRoundedRect(0, 0, size, size, radius, radius)
         painter.setClipPath(path)
         painter.drawPixmap(0, 0, scaled)
         painter.end()
@@ -735,12 +911,28 @@ class TaskbarLyricsWidget(QWidget):
             return
         try:
             hwnd = int(self.winId())
-            apply_overlay_window_styles(hwnd)
+            apply_overlay_window_styles(hwnd, click_through=not getattr(self, 'move_mode', False))
         except Exception:
             pass
 
     def check_status(self):
         truly_visible = is_window_truly_visible(self)
+
+        # Captura de áudio (detector de voz) só quando é útil: música sem timing real, tocando
+        det = getattr(self.state, 'voice_detector', None)
+        if det is not None:
+            want = bool(self.state.has_track and self.state.is_playing and self.state.lyrics and getattr(self.state, 'sync_mode', 'estimate') == 'estimate')
+            if det.enabled != want:
+                det.enabled = want
+        self._fit_ticks = getattr(self, '_fit_ticks', 0) + 1
+        if self._fit_ticks % 40 == 0 and not getattr(self, 'move_mode', False) and not getattr(self, '_morphing', False):
+            self.apply_saved_position()
+
+        if getattr(self, 'move_mode', False):
+            if not truly_visible:
+                self.show_window()
+            return
+
 
         if self.state.has_track:
             if self.state.is_timed_out():
@@ -767,7 +959,17 @@ class TaskbarLyricsWidget(QWidget):
     def on_artwork_loaded(self, img_bytes):
         pix = QPixmap()
         if pix.loadFromData(img_bytes):
-            self.lbl_art.setPixmap(self.get_rounded_pixmap(pix))
+            self._art_src = pix
+            self.apply_art_style()
+            self.card_color = self.card_color_from_art(pix)
+            self.update()
+
+    @staticmethod
+    def card_color_from_art(pix):
+        """Cor média da capa, escurecida, para o fundo do cartão."""
+        c = pix.toImage().scaled(1, 1, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation).pixelColor(0, 0)
+        h, s, v, _ = c.getHsv()
+        return QColor.fromHsv(max(h, 0), min(int(s * 0.85), 190), 58).getRgb()[:3]
 
     def on_stop_playback(self):
         log_debug("[UI] Sinal de parada recebido.")
@@ -795,6 +997,8 @@ class TaskbarLyricsWidget(QWidget):
 
         l1, l2, prog, is_card = self.state.get_display_state()
         self.karaoke_widget.sync_mode = getattr(self.state, "sync_mode", "estimate")
+        if getattr(self, 'island', False):
+            self.fit_island_width()
         # Preenchimento da 2a linha só quando ela é a tradução do verso atual (ou card/nota simétrica)
         is_trans = bool(getattr(self.state, "line2_is_translation", False) or (is_card and getattr(self.state, "translate_enabled", False)))
         self.karaoke_widget.set_state(l1, l2, prog, is_card, is_trans)
